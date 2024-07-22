@@ -1,0 +1,6 @@
+pl09_minc.sos.ipynb
+test
+parser
+rs/minc/**
+!rs/**/src
+!minc_cogen.rs
