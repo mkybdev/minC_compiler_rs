@@ -31,13 +31,16 @@ pub fn ast_to_asm_program(_program: minc_ast::Program) -> String {
 #[allow(unreachable_code, unused_variables)]
 /// Returns the header part of the machine code
 fn header() -> String {
-    format!("")
+    format!("\t{}\n\t{}\n", ".file \"program.minc\"", ".text")
 }
 
 #[allow(unreachable_code, unused_variables)]
 /// Returns the trailer part of the machine code
 fn trailer() -> String {
-    format!("")
+    format!(
+        "\t{}\n\t{}",
+        ".ident \"MCC\"", ".section .note.GNU-stack,\"\",@progbits"
+    )
 }
 
 #[allow(unreachable_code, unused_variables)]
@@ -45,7 +48,7 @@ fn trailer() -> String {
 /// Environment for variables in a scope
 struct Environment {
     /// Maps variable names to their locations
-    env: std::collections::HashMap<String, i64>,
+    env: std::collections::HashMap<String, String>,
 }
 
 #[allow(unreachable_code, unused_variables)]
@@ -62,14 +65,14 @@ impl Environment {
     fn lookup(&self, x: &str) -> Option<String> {
         let loc = self.env.get(x);
         match loc {
-            Some(loc) => Some(format!("{:?}(%rsp)", loc)),
+            Some(loc) => Some(loc.to_string()),
             None => None,
         }
     }
 
     /// Takes a variable name and a location
     /// Returns a new environment with the variable added
-    fn add(&self, x: &str, loc: i64) -> Environment {
+    fn add(&self, x: &str, loc: String) -> Environment {
         let mut env2 = Environment {
             env: self.env.clone(),
         };
@@ -89,7 +92,7 @@ impl Environment {
         // Iterates over the declarations
         decls.iter().fold((env2, loc), |(env, loc), decl| {
             // Adds the variable to the environment and increments BFS
-            (env.add(&decl.name, loc), loc + 8)
+            (env.add(&decl.name, format!("{}(%rsp)", loc)), loc + 8)
         })
     }
 }
@@ -106,11 +109,48 @@ fn ast_to_asm_def(def: &minc_ast::Def) -> String {
     match def {
         // Extracts the function name, parameters, return type, and body
         minc_ast::Def::Fun(name, params, return_type, body) => {
+            let (prologue, env) = gen_prologue(def); // Generates the prologue
             format!(
                 "{}\n{}\n{}\n",
-                gen_prologue(def),
-                ast_to_asm_stmt(body, Environment::new(), 0), // Compiles the function body
+                prologue,
+                ast_to_asm_stmt(body, env, 0), // Compiles the function body
                 gen_epilogue(def)
+            )
+        }
+    }
+}
+
+static ARGS_REGS: [&str; 6] = ["%rdi", "%rsi", "%rdx", "%rcx", "%r8", "%r9"];
+
+#[allow(unreachable_code, unused_variables)]
+/// Takes a definition
+/// Returns the prologue part of the definition
+fn gen_prologue(def: &minc_ast::Def) -> (String, Environment) {
+    match def {
+        minc_ast::Def::Fun(name, params, ..) => {
+            // Save arguments to the environment
+            let env = params
+                .iter()
+                .enumerate()
+                .fold(Environment::new(), |env, (i, param)| {
+                    let loc = ARGS_REGS[i];
+                    env.add(&param.name, loc.to_string())
+                });
+            (
+                format!(
+                    "\t{}\n\t{}\n\t{}\n{}\n{}\n\t{}\n\t{}\n\t{}\n\t{}\n\t{}\n",
+                    ".p2align 4",
+                    format!(".globl {}", name),
+                    format!(".type {}, @function", name),
+                    format!("{}:", name),
+                    ".LFB0:",
+                    ".cfi_startproc",
+                    "endbr64",
+                    "pushq %rbx",
+                    "movq %rsp, %rbx",
+                    "subq $16, %rsp"
+                ),
+                env,
             )
         }
     }
@@ -118,16 +158,21 @@ fn ast_to_asm_def(def: &minc_ast::Def) -> String {
 
 #[allow(unreachable_code, unused_variables)]
 /// Takes a definition
-/// Returns the prologue part of the definition
-fn gen_prologue(def: &minc_ast::Def) -> String {
-    format!("")
-}
-
-#[allow(unreachable_code, unused_variables)]
-/// Takes a definition
 /// Returns the epilogue part of the definition
 fn gen_epilogue(def: &minc_ast::Def) -> String {
-    format!("")
+    match def {
+        minc_ast::Def::Fun(name, ..) => {
+            format!(
+                "\t{}\n\t{}\n\t{}\n\t{}\n{}\n\t{}\n",
+                "movq %rbx, %rsp",
+                "popq %rbx",
+                "ret",
+                ".cfi_endproc",
+                ".LFE0:",
+                format!(".size {}, .-{}", name, name)
+            )
+        }
+    }
 }
 
 #[allow(unreachable_code, unused_variables)]
@@ -138,7 +183,17 @@ fn ast_to_asm_stmt(stmt: &minc_ast::Stmt, env: Environment, v: i64) -> String {
         minc_ast::Stmt::Empty => format!(""),
         minc_ast::Stmt::Continue => format!(""),
         minc_ast::Stmt::Break => format!(""),
-        minc_ast::Stmt::Return(expr) => format!(""),
+        minc_ast::Stmt::Return(expr) => {
+            // Compiles the return statement as follows:
+            //     [Compiled expression]
+            //     movq [Expression], %rax
+            let (insns, op) = ast_to_asm_expr(expr, env, v); // Compiles the expression
+            format!(
+                "{}\n{}\n",
+                insns,
+                format!("\tmovq {}(%rsp), %rax", op), // Moves the result to the return register
+            )
+        }
         minc_ast::Stmt::Expr(expr) => format!(""),
         minc_ast::Stmt::Compound(decls, stmts) => {
             // A new compound statement means a new scope
@@ -161,16 +216,16 @@ fn ast_to_asm_stmt(stmt: &minc_ast::Stmt, env: Environment, v: i64) -> String {
             //          [Compiled condition]
             //          cmpq $0, [Condition]
             //          jne .Ls
-            let (cond_op, cond_insns) = ast_to_asm_expr(cond, env.clone(), v); // Compiles the condition
+            let (cond_insns, cond_op) = ast_to_asm_expr(cond, env.clone(), v); // Compiles the condition
             format!(
                 "{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
-                "jmp .Lc",
+                "\tjmp .Lc",
                 ".Ls:",
                 ast_to_asm_stmt(body, env, v), // Compiles the body
                 ".Lc:",
                 cond_insns,
-                format!("cmpq $0, {}", cond_op),
-                "jne .Ls"
+                format!("\tcmpq $0, {}", cond_op),
+                "\tjne .Ls"
             )
         }
     }
@@ -192,12 +247,12 @@ fn cogen_stmts(stmts: &Vec<minc_ast::Stmt>, env: Environment, v: i64) -> String 
 /// Returns the machine code of the expression and the location of the result
 fn ast_to_asm_expr(expr: &minc_ast::Expr, env: Environment, v: i64) -> (String, i64) {
     match expr {
-        minc_ast::Expr::IntLiteral(n) => (format!(""), v),
+        minc_ast::Expr::IntLiteral(n) => (format!("\tmovq ${}, {}(%rsp)", n, v), v),
         minc_ast::Expr::Id(x) => {
             // If the variable is found in the environment
             if let Some(loc) = env.lookup(x) {
                 // Moves the variable to the stack
-                (format!("movq {}, {}(%rsp)", loc, v), v)
+                (format!("\tmovq {}, {}(%rsp)", loc, v), v)
             } else {
                 panic!("Variable {} not found", x)
             }
@@ -219,17 +274,46 @@ fn ast_to_asm_expr(expr: &minc_ast::Expr, env: Environment, v: i64) -> (String, 
                             // Compiles the first operand
                             // The second operand is compiled first to ensure that the result is stored in the first operand
                             let (insns0, op0) = ast_to_asm_expr(&e[0], env, v + 8);
-                            let m = format!("{}(%rsp)", v); // Where to copy the second operand
+                            // let m = format!("{}(%rsp)", v); // Where to copy the second operand
                             (
                                 format!(
                                     "{}\n{}\n{}\n{}\n",
                                     insns1, // Compiles the second operand
-                                    format!("movq {}, {}", op1, m), // Copies the second operand to the stack
-                                    insns0,                         // Compiles the first operand
-                                    format!("addq {}, {}", m, op0) // Adds the first operand to the second operand
+                                    // format!("\tmovq {}(%rsp), {}", op1, m), // Copies the second operand to the stack
+                                    format!("\tmovq {}(%rsp), %rax", op1),
+                                    insns0, // Compiles the first operand
+                                    // format!("\taddq {}, {}(%rsp)", m, op0) // Adds the first operand to the second operand
+                                    format!("\taddq %rax, {}(%rsp)", op0)
                                 ),
                                 op0, // The result is stored in the first operand
                             )
+                        }
+                        "-" => {
+                            // For negative numbers
+                            if e.len() == 1 {
+                                let (insns0, op0) = ast_to_asm_expr(&e[0], env, v);
+                                (
+                                    format!("{}\n{}\n", insns0, format!("\tnegq {}(%rsp)", op0)),
+                                    op0,
+                                )
+                            } else {
+                                // Compiles the second operand
+                                let (insns1, op1) = ast_to_asm_expr(&e[1], env.clone(), v);
+                                // Compiles the first operand
+                                // The second operand is compiled first to ensure that the result is stored in the first operand
+                                let (insns0, op0) = ast_to_asm_expr(&e[0], env, v + 8);
+                                let m = format!("{}(%rsp)", v); // Where to copy the second operand
+                                (
+                                    format!(
+                                        "{}\n{}\n{}\n{}\n",
+                                        insns1, // Compiles the second operand
+                                        format!("\tmovq {}, {}", op1, m), // Copies the second operand to the stack
+                                        insns0, // Compiles the first operand
+                                        format!("\tsubq {}, {}", m, op0) // Subtracts the first operand from the second operand
+                                    ),
+                                    op0, // The result is stored in the first operand
+                                )
+                            }
                         }
                         _ => panic!("Unknown operator {}", op),
                     }
@@ -256,15 +340,15 @@ fn ast_to_asm_expr(expr: &minc_ast::Expr, env: Environment, v: i64) -> (String, 
                             (
                                 format!(
                                     "{}\n{}\n{}\n",
-                                    format!("movq {}, {}", op1, m1), // Copies the second operand to the stack
+                                    format!("\tmovq {}, {}", op1, m1), // Copies the second operand to the stack
                                     insns0,
                                     format!(
                                         "{}\n{}\n{}\n{}\n{}\n",
-                                        format!("movq {}, {}", op0, m0), // Copies the first operand to the stack
-                                        "movq $0, %rax", // Initializes the result to 0
-                                        format!("movq {}, {}", m0, op0), // Restores the first operand
-                                        format!("cmpq {}, {}", m1, op0), // Compares the first and second operands
-                                        "setl %al" // Sets the result to 1 if the first operand is less than the second operand
+                                        format!("\tmovq {}, {}", op0, m0), // Copies the first operand to the stack
+                                        "\tmovq $0, %rax", // Initializes the result to 0
+                                        format!("\tmovq {}, {}", m0, op0), // Restores the first operand
+                                        format!("\tcmpq {}, {}", m1, op0), // Compares the first and second operands
+                                        "\tsetl %al" // Sets the result to 1 if the first operand is less than the second operand
                                     ),
                                 ),
                                 op0, // The result is stored in the first operand
@@ -278,14 +362,14 @@ fn ast_to_asm_expr(expr: &minc_ast::Expr, env: Environment, v: i64) -> (String, 
         }
         minc_ast::Expr::Call(f, args) => {
             // arg_vars: The locations of the arguments
-            let (insns, arg_vars) = ast_to_asm_exprs(args, env.clone(), v);
+            let (insns, arg_vars) = ast_to_asm_exprs(args, env, v);
             let arg_regs = vec!["%rdi", "%rsi", "%rdx", "%rcx", "%r8", "%r9"];
             let mut call_insns = arg_vars
                 .iter()
                 .enumerate()
                 .map(|(i, arg_var)| {
                     format!(
-                        "movq {}, {}",
+                        "\tmovq {}, {}",
                         arg_var,
                         if i < arg_regs.len() {
                             format!("{}", arg_regs[i])
@@ -296,7 +380,12 @@ fn ast_to_asm_expr(expr: &minc_ast::Expr, env: Environment, v: i64) -> (String, 
                 })
                 .collect::<Vec<String>>()
                 .join("\n");
-            call_insns.push_str(&format!("call {}@PLT", ast_to_asm_expr(f, env, v).0));
+            match &**f {
+                minc_ast::Expr::Id(name) => {
+                    call_insns.push_str(&format!("\tcall {}@PLT", name));
+                }
+                _ => panic!("Function name must be an identifier"),
+            }
             (format!("{}\n{}", insns, call_insns), arg_vars[0])
         }
         minc_ast::Expr::Paren(sub_expr) => (format!(""), v),
