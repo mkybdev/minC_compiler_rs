@@ -1,4 +1,6 @@
 pl09_minc.sos.ipynb
+.vscode
+test.sh
 test
 parser
 rs/minc/**
