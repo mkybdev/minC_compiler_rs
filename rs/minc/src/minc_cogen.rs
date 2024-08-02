@@ -21,7 +21,8 @@ pub fn ast_to_asm_program(_program: minc_ast::Program) -> String {
         _program
             .defs
             .iter()
-            .map(|def| ast_to_asm_def(def)) // Compiles each function definition
+            .enumerate()
+            .map(|(i, def)| ast_to_asm_def(def, i)) // Compiles each function definition
             .collect::<Vec<String>>()
             .join("\n"),
         trailer()
@@ -210,19 +211,19 @@ impl Environment {
 ///      Function body,
 ///      Epilogue (Shrinks stack, returns value).
 /// Returns the concatenated string as the machine code of the function definition.
-fn ast_to_asm_def(def: &minc_ast::Def) -> String {
+fn ast_to_asm_def(def: &minc_ast::Def, i: usize) -> String {
     // Always a function definition for now
     match def {
         // Extracts the function name, parameters, return type, and body
         minc_ast::Def::Fun(name, params, return_type, body) => {
             // Generates the prologue
             // Returns the prologue, environment, and free registers
-            let (prologue, env, mut free_regs) = gen_prologue(def);
+            let (prologue, env, mut free_regs, v) = gen_prologue(def, i);
             format!(
                 "{}\n{}\n{}\n",
                 prologue,
-                ast_to_asm_stmt(body, env, 0, &mut free_regs), // Compiles the function body
-                gen_epilogue(def)
+                ast_to_asm_stmt(body, env, v, &mut free_regs, &mut format!(".L{}0", i)), // Compiles the function body
+                gen_epilogue(def, i)
             )
         }
     }
@@ -231,15 +232,23 @@ fn ast_to_asm_def(def: &minc_ast::Def) -> String {
 #[allow(unreachable_code, unused_variables)]
 /// Takes a definition.
 /// Returns the prologue part of the definition.
-fn gen_prologue(def: &minc_ast::Def) -> (String, Environment, Vec<Register>) {
+fn gen_prologue(def: &minc_ast::Def, i: usize) -> (String, Environment, Vec<Register>, i64) {
     match def {
         minc_ast::Def::Fun(name, params, ..) => {
             // Save arguments to the environment
+            const GROWTH: i64 = 2;
             let env = params
                 .iter()
                 .enumerate()
                 .fold(Environment::new(), |env, (i, param)| {
-                    let loc = Location::Register(ARGS_REGS[i]); // Get the argument register
+                    let loc = if i < ARGS_REGS.len() {
+                        Location::Register(ARGS_REGS[i])
+                    } else {
+                        // offset for rbx, stack growth + offset for arguments
+                        Location::Stack(Stack::RSP(
+                            (8 + 8 * GROWTH) + 8 * (i - ARGS_REGS.len() + 1) as i64,
+                        ))
+                    }; // Get the argument location
                     env.add(&param.name, loc)
                 });
             (
@@ -249,20 +258,29 @@ fn gen_prologue(def: &minc_ast::Def) -> (String, Environment, Vec<Register>) {
                     format!(".globl {}", name),
                     format!(".type {}, @function", name),
                     format!("{}:", name),
-                    ".LFB0:",
+                    format!(".LFB{}:", i),
                     ".cfi_startproc",
                     "endbr64",
-                    "pushq %rbx",      // Save callee-save register
-                    "movq %rsp, %rbx", // Save stack pointer
-                    "subq $16, %rsp"   // Allocate space for local variables (temporary)
+                    "pushq %rbx",                          // Save callee-save register
+                    "movq %rsp, %rbx",                     // Save stack pointer
+                    format!("subq ${}, %rsp", 8 * GROWTH)  // Grow stack
                 ),
                 env,
                 [
                     vec![Register::RAX],
-                    ARGS_REGS[params.len()..].to_vec(), // Registers for arguments which are not used
+                    if params.len() < ARGS_REGS.len() {
+                        ARGS_REGS[params.len()..].to_vec()
+                    } else {
+                        vec![]
+                    }, // Registers for arguments which are not used
                     vec![Register::R10, Register::R11],
                 ]
                 .concat(),
+                if params.len() > ARGS_REGS.len() {
+                    (8 + 8 * GROWTH) + 8 * (params.len() - ARGS_REGS.len() + 1) as i64
+                } else {
+                    0
+                }, // BFS
             )
         }
     }
@@ -271,7 +289,7 @@ fn gen_prologue(def: &minc_ast::Def) -> (String, Environment, Vec<Register>) {
 #[allow(unreachable_code, unused_variables)]
 /// Takes a definition.
 /// Returns the epilogue part of the definition.
-fn gen_epilogue(def: &minc_ast::Def) -> String {
+fn gen_epilogue(def: &minc_ast::Def, i: usize) -> String {
     match def {
         minc_ast::Def::Fun(name, ..) => {
             format!(
@@ -280,11 +298,28 @@ fn gen_epilogue(def: &minc_ast::Def) -> String {
                 "popq %rbx",       // Restore callee-save register
                 "ret",
                 ".cfi_endproc",
-                ".LFE0:",
+                format!(".LFE{}:", i),
                 format!(".size {}, .-{}", name, name)
             )
         }
     }
+}
+
+#[allow(unreachable_code, unused_variables)]
+/// Returns the next label.
+fn next_label(label: &mut String) -> String {
+    let next = label.clone();
+    *label = format!(
+        ".L{:0>2}",
+        label
+            .chars()
+            .skip(2)
+            .collect::<String>()
+            .parse::<i64>()
+            .unwrap()
+            + 1
+    );
+    next
 }
 
 #[allow(unreachable_code, unused_variables)]
@@ -295,6 +330,7 @@ fn ast_to_asm_stmt(
     env: Environment,
     v: i64,
     regs: &mut Vec<Register>,
+    label: &mut String,
 ) -> String {
     match stmt {
         minc_ast::Stmt::Empty => format!(""),
@@ -308,21 +344,64 @@ fn ast_to_asm_stmt(
             format!(
                 "{}\n{}\n",
                 insns,
-                format!("\tmovq {}(%rsp), %rax", op), // Moves the result to the return register
+                match op {
+                    Register::RAX => format!(""),
+                    _ => format!("\tmovq {}, %rax", op), // Moves the result to the return register
+                }
             )
         }
-        minc_ast::Stmt::Expr(expr) => format!(""),
+        minc_ast::Stmt::Expr(expr) => {
+            let (insns, op) = ast_to_asm_expr(expr, env, v, regs); // Compiles the expression
+            format!("{}\n", insns)
+        }
         minc_ast::Stmt::Compound(decls, stmts) => {
             // A new compound statement means a new scope
             // Extends the environment with the new variables
             let (env2, v2) = env.extend(decls, Stack::RSP(v));
-            cogen_stmts(stmts, env2, v2, regs) // Compiles the statements
+            cogen_stmts(stmts, env2, v2, regs, label) // Compiles the statements
         }
         minc_ast::Stmt::If(cond, then_stmt, Some(else_stmt)) => {
-            format!("")
+            // Compiles the if-else statement as follows:
+            //     [Compiled condition]
+            //     cmpq $0, [Condition]
+            //     je .Lc <- jump to else part if condition is false
+            //     [Compiled then statement]
+            //     jmp .Le
+            //     .Lc: <- else part
+            //          [Compiled else statement]
+            //     .Le:
+            let (cond_insns, cond_op) = ast_to_asm_expr(cond, env.clone(), v, regs); // Compiles the condition
+            let label_lc = next_label(label);
+            let label_le = next_label(label);
+            format!(
+                "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
+                cond_insns,
+                format!("\tcmpq $0, {}", cond_op), // Compares the condition with 0
+                format!("\tje {}", label_lc),
+                ast_to_asm_stmt(then_stmt, env.clone(), v, regs, label), // Compiles the then statement
+                format!("\tjmp {}", label_le),
+                format!("{}:", label_lc),
+                ast_to_asm_stmt(else_stmt, env, v, regs, label), // Compiles the else statement
+                format!("{}:", label_le),
+            )
         }
         minc_ast::Stmt::If(cond, then_stmt, None) => {
-            format!("")
+            // Compiles the if statement as follows:
+            //     [Compiled condition]
+            //     cmpq $0, [Condition]
+            //     je .Lc <- jump to end if condition is false
+            //     [Compiled then statement]
+            //     .Lc:
+            let (cond_insns, cond_op) = ast_to_asm_expr(cond, env.clone(), v, regs); // Compiles the condition
+            let label_lc = next_label(label);
+            format!(
+                "{}\n{}\n{}\n{}\n{}\n",
+                cond_insns,
+                format!("\tcmpq $0, {}", cond_op), // Compares the condition with 0
+                format!("\tje {}", label_lc),
+                ast_to_asm_stmt(then_stmt, env.clone(), v, regs, label), // Compiles the then statement
+                format!("{}:", label_lc),
+            )
         }
         minc_ast::Stmt::While(cond, body) => {
             // Compiles the while statement as follows:
@@ -334,15 +413,17 @@ fn ast_to_asm_stmt(
             //          cmpq $0, [Condition]
             //          jne .Ls
             let (cond_insns, cond_op) = ast_to_asm_expr(cond, env.clone(), v, regs); // Compiles the condition
+            let label_lc = next_label(label);
+            let label_ls = next_label(label);
             format!(
                 "{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
-                "\tjmp .Lc",
-                ".Ls:",                              // Statements part
-                ast_to_asm_stmt(body, env, v, regs), // Compiles the body
-                ".Lc:",                              // Condition part
+                format!("\tjmp {}", label_lc),
+                format!("{}:", label_ls),                   // Body part
+                ast_to_asm_stmt(body, env, v, regs, label), // Compiles the body
+                format!("{}:", label_lc),                   // Condition part
                 cond_insns,
                 format!("\tcmpq $0, {}", cond_op), // Compares the condition with 0
-                "\tjne .Ls"
+                format!("\tjne {}", label_ls),
             )
         }
     }
@@ -356,10 +437,11 @@ fn cogen_stmts(
     env: Environment,
     v: i64,
     regs: &mut Vec<Register>,
+    label: &mut String,
 ) -> String {
     stmts
         .iter()
-        .map(|stmt| ast_to_asm_stmt(stmt, env.clone(), v, regs)) // Compiles each statement
+        .map(|stmt| ast_to_asm_stmt(stmt, env.clone(), v, regs, label)) // Compiles each statement
         .collect::<Vec<String>>()
         .join("\n")
 }
@@ -375,13 +457,13 @@ fn ast_to_asm_expr(
 ) -> (String, Register) {
     match expr {
         minc_ast::Expr::IntLiteral(n) => {
-            let reg = regs[0]; // Get the first free register
+            let reg = regs.remove(0); // Removes and get the first free register
             (format!("\tmovq ${}, {}", n, reg), reg)
         }
         minc_ast::Expr::Id(x) => {
             // If the variable is found in the environment
             if let Some(loc) = env.lookup(x) {
-                let reg = regs[0]; // Get the first free register
+                let reg = regs.remove(0); // Removes and get the first free register
                 (format!("\tmovq {}, {}", loc, reg), reg)
             } else {
                 panic!("Variable {} not found", x)
@@ -418,11 +500,11 @@ fn ast_to_asm_expr(
                             } else {
                                 // Compiles the second operand
                                 let (insns1, op1) = ast_to_asm_expr(&e[1], env.clone(), v, regs);
-                                regs.remove(0); // Removes the first free register
-                                                // Compiles the first operand
-                                                // The second operand is compiled first to ensure that the result is stored in the first operand
+                                // Compiles the first operand
+                                // The second operand is compiled first to ensure that the result is stored in the first operand
                                 let (insns0, op0) = ast_to_asm_expr(&e[0], env, v + 8, regs);
                                 let m = Stack::RSP(v); // Where to copy the first operand
+                                regs.push(op1); // Adds the second operand to the free registers
                                 (
                                     format!(
                                         "{}\n{}\n{}\n{}\n",
@@ -443,24 +525,27 @@ fn ast_to_asm_expr(
                         //    [Compiled second operand]
                         //    movq [Second operand], [Stack]
                         //    [Compiled first operand]
-                        //    imulq [Second operand in stack], [First operand], [First operand]
+                        //    movq [First operand], %rax
+                        //    mulq [Second operand in stack] <- result in rax
                         "*" => {
                             // Compiles the second operand
                             let (insns1, op1) = ast_to_asm_expr(&e[1], env.clone(), v, regs);
-                            regs.remove(0); // Removes the first free register
-                                            // Compiles the first operand
-                                            // The second operand is compiled first to ensure that the result is stored in the first operand
+                            // Compiles the first operand
+                            // The second operand is compiled first to ensure that the result is stored in the first operand
                             let (insns0, op0) = ast_to_asm_expr(&e[0], env, v + 8, regs);
                             let m = Stack::RSP(v); // Where to copy the first operand
+                            regs.push(op0); // Adds the first operand to the free registers
+                            regs.push(op1); // Adds the second operand to the free registers
                             (
                                 format!(
-                                    "{}\n{}\n{}\n{}\n",
+                                    "{}\n{}\n{}\n{}\n{}\n",
                                     insns1, // Compiles the second operand
                                     format!("\tmovq {}, {}", op1, m),
                                     insns0, // Compiles the first operand
-                                    format!("\timulq {}, {}, {}", m, op0, op0), // Multiplies the operands
+                                    format!("\tmovq {}, %rax", op0),
+                                    format!("\tmulq {}", m),
                                 ),
-                                op0, // The result is stored in the first operand
+                                Register::RAX, // The result is stored in rax
                             )
                         }
                         // Compiles as follows:
@@ -473,11 +558,12 @@ fn ast_to_asm_expr(
                         "/" | "%" => {
                             // Compiles the second operand
                             let (insns1, op1) = ast_to_asm_expr(&e[1], env.clone(), v, regs);
-                            regs.remove(0); // Removes the first free register
-                                            // Compiles the first operand
-                                            // The second operand is compiled first to ensure that the result is stored in the first operand
+                            // Compiles the first operand
+                            // The second operand is compiled first to ensure that the result is stored in the first operand
                             let (insns0, op0) = ast_to_asm_expr(&e[0], env, v + 8, regs);
                             let m = Stack::RSP(v); // Where to copy the first operand
+                            regs.push(op0); // Adds the first operand to the free registers
+                            regs.push(op1); // Adds the second operand to the free registers
                             (
                                 format!(
                                     "{}\n{}\n{}\n{}\n{}\n{}\n",
@@ -508,17 +594,19 @@ fn ast_to_asm_expr(
                 //    movq [First operand in stack], [First operand]
                 //    cmpq [Second operand in stack], [First operand]
                 //    setl/setle/setg/setge/sete/setne %al
+                //    movzbq %al, %rax <- zero extends %al to %rax
                 "<" | "<=" | ">" | ">=" | "==" | "!=" => {
                     // Compiles the second operand
                     let (insns1, op1) = ast_to_asm_expr(&e[1], env.clone(), v, regs);
-                    regs.remove(0); // Removes the first free register
-                                    // Compiles the first operand
+                    // Compiles the first operand
                     let (insns0, op0) = ast_to_asm_expr(&e[0], env, v + 8, regs);
                     let m0 = Stack::RSP(v); // Where to copy the first operand
                     let m1 = Stack::RSP(v + 8); // Where to copy the second operand
+                    regs.push(op0); // Adds the first operand to the free registers
+                    regs.push(op1); // Adds the second operand to the free registers
                     (
                         format!(
-                            "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
+                            "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
                             insns1,
                             format!("\tmovq {}, {}", op1, m1), // Copies the second operand to the stack
                             insns0,
@@ -535,7 +623,8 @@ fn ast_to_asm_expr(
                                 "==" => "\tsete %al",
                                 "!=" => "\tsetne %al",
                                 _ => panic!("Unknown operator {}", op),
-                            }
+                            },
+                            "\tmovzbq %al, %rax",
                         ),
                         Register::RAX, // The result is stored in rax
                     )
@@ -546,17 +635,20 @@ fn ast_to_asm_expr(
                     //    [Compiled operand]
                     //    testq [Operand], [Operand] <- sets flags: 1 if 0, 0 if not 0
                     //    sete %al <- sets %al to 1 if the zero flag is set, 0 if not
+                    //    movzbq %al, %rax <- zero extends %al to %rax
                     "!" => {
                         if e.len() != 1 {
                             panic!("Expected 1 operand for !")
                         } else {
                             let (insns, op) = ast_to_asm_expr(&e[0], env, v, regs);
+                            regs.push(op); // Adds the operand to the free registers
                             (
                                 format!(
-                                    "{}\n{}\n{}\n",
+                                    "{}\n{}\n{}\n{}\n",
                                     insns,
                                     format!("\ttestq {}, {}", op, op),
-                                    "\tsete %al"
+                                    "\tsete %al",
+                                    "\tmovzbq %al, %rax",
                                 ),
                                 Register::RAX,
                             )
@@ -570,6 +662,7 @@ fn ast_to_asm_expr(
                             panic!("Expected 1 operand for ~")
                         } else {
                             let (insns, op) = ast_to_asm_expr(&e[0], env, v, regs);
+                            regs.push(op); // Adds the operand to the free registers
                             (
                                 // bitwise not
                                 format!("{}\n{}\n", insns, format!("\tnotq {}", op)),
@@ -579,6 +672,29 @@ fn ast_to_asm_expr(
                     }
                     _ => panic!("Unknown operator {}", op),
                 },
+                // Assignment instruction
+                "=" => {
+                    if e.len() != 2 {
+                        panic!("Expected 2 operands for =")
+                    } else {
+                        // Compiles the second operand
+                        let (insns1, op1) = ast_to_asm_expr(&e[1], env.clone(), v, regs);
+                        // Get the location of the first operand
+                        if let minc_ast::Expr::Id(x) = &e[0] {
+                            // If the variable is found in the environment
+                            if let Some(loc) = env.lookup(x) {
+                                (
+                                    format!("{}\n{}\n", insns1, format!("\tmovq {}, {}", op1, loc)),
+                                    Register::RAX,
+                                )
+                            } else {
+                                panic!("Variable {} not found", x)
+                            }
+                        } else {
+                            panic!("Expected an identifier for the first operand")
+                        }
+                    }
+                }
                 _ => panic!("Unknown operator {}", op),
             }
         }
@@ -604,7 +720,7 @@ fn ast_to_asm_expr(
                 .join("\n");
             match &**f {
                 minc_ast::Expr::Id(name) => {
-                    call_insns.push_str(&format!("\tcall {}@PLT", name));
+                    call_insns.push_str(&format!("\n\tcall {}@PLT", name));
                 }
                 _ => panic!("Function name must be an identifier"),
             }
