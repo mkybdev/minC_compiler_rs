@@ -146,9 +146,9 @@ fn gen_prologue(def: &minc_ast::Def) -> (String, Environment) {
                     ".LFB0:",
                     ".cfi_startproc",
                     "endbr64",
-                    "pushq %rbx",
-                    "movq %rsp, %rbx",
-                    "subq $16, %rsp"
+                    "pushq %rbx",      // Save callee-save register
+                    "movq %rsp, %rbx", // Save stack pointer
+                    "subq $16, %rsp"   // Allocate space for local variables (temporary)
                 ),
                 env,
             )
@@ -164,8 +164,8 @@ fn gen_epilogue(def: &minc_ast::Def) -> String {
         minc_ast::Def::Fun(name, ..) => {
             format!(
                 "\t{}\n\t{}\n\t{}\n\t{}\n{}\n\t{}\n",
-                "movq %rbx, %rsp",
-                "popq %rbx",
+                "movq %rbx, %rsp", // Restore stack pointer
+                "popq %rbx",       // Restore callee-save register
                 "ret",
                 ".cfi_endproc",
                 ".LFE0:",
@@ -220,11 +220,11 @@ fn ast_to_asm_stmt(stmt: &minc_ast::Stmt, env: Environment, v: i64) -> String {
             format!(
                 "{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
                 "\tjmp .Lc",
-                ".Ls:",
+                ".Ls:",                        // Statements part
                 ast_to_asm_stmt(body, env, v), // Compiles the body
-                ".Lc:",
+                ".Lc:",                        // Condition part
                 cond_insns,
-                format!("\tcmpq $0, {}", cond_op),
+                format!("\tcmpq $0, {}", cond_op), // Compares the condition with 0
                 "\tjne .Ls"
             )
         }
@@ -247,7 +247,9 @@ fn cogen_stmts(stmts: &Vec<minc_ast::Stmt>, env: Environment, v: i64) -> String 
 /// Returns the machine code of the expression and the location of the result
 fn ast_to_asm_expr(expr: &minc_ast::Expr, env: Environment, v: i64) -> (String, i64) {
     match expr {
-        minc_ast::Expr::IntLiteral(n) => (format!("\tmovq ${}, {}(%rsp)", n, v), v),
+        minc_ast::Expr::IntLiteral(n) => {
+            (format!("\tmovq ${}, {}(%rsp)", n, v), v) // Moves the integer to the stack
+        }
         minc_ast::Expr::Id(x) => {
             // If the variable is found in the environment
             if let Some(loc) = env.lookup(x) {
@@ -265,12 +267,13 @@ fn ast_to_asm_expr(expr: &minc_ast::Expr, env: Environment, v: i64) -> (String, 
                     match op {
                         // Compiles as follows:
                         //    [Compiled second operand]
-                        //    movq [Second operand], [Stack]
+                        //    movq [Second operand], [temp register (rax)] <- able to use stack?
                         //    [Compiled first operand]
-                        //    addq [Second operand in stack], [First operand]
+                        //    addq/subq [Second operand in temp register], [First operand in stack]
                         "+" | "-" => {
-                            // For positive numbers
+                            // For positive/negative numbers
                             if e.len() == 1 {
+                                // Compiles the operand
                                 let (insns0, op0) = ast_to_asm_expr(&e[0], env, v);
                                 (
                                     match op {
@@ -278,7 +281,7 @@ fn ast_to_asm_expr(expr: &minc_ast::Expr, env: Environment, v: i64) -> (String, 
                                         "-" => format!(
                                             "{}\n{}\n",
                                             insns0,
-                                            format!("\tnegq {}(%rsp)", op0)
+                                            format!("\tnegq {}(%rsp)", op0) // Negates the number
                                         ),
                                         _ => panic!("Unknown operator {}", op),
                                     },
@@ -306,6 +309,12 @@ fn ast_to_asm_expr(expr: &minc_ast::Expr, env: Environment, v: i64) -> (String, 
                                 )
                             }
                         }
+                        // Compiles as follows:
+                        //    [Compiled second operand]
+                        //    movq [Second operand], [temp register (rax)] <- able to use stack?
+                        //    [Compiled first operand]
+                        //    mulq [First operand in stack] <- result in temp register
+                        //    movq [temp register], [First operand in stack]
                         "*" => {
                             // Compiles the second operand
                             let (insns1, op1) = ast_to_asm_expr(&e[1], env.clone(), v);
@@ -324,6 +333,13 @@ fn ast_to_asm_expr(expr: &minc_ast::Expr, env: Environment, v: i64) -> (String, 
                                 op0, // The result is stored in the first operand
                             )
                         }
+                        // Compiles as follows:
+                        //    [Compiled second operand]
+                        //    [Compiled first operand]
+                        //    movq [First operand in stack], [temp register (rax)] <- able to use stack?
+                        //    xor %rdx, %rdx <- clear rdx
+                        //    divq [Second operand in stack] <- result in rax, remainder in rdx
+                        //    movq [rax/rdx], [First operand in stack]
                         "/" | "%" => {
                             // Compiles the second operand
                             let (insns1, op1) = ast_to_asm_expr(&e[1], env.clone(), v);
@@ -391,6 +407,13 @@ fn ast_to_asm_expr(expr: &minc_ast::Expr, env: Environment, v: i64) -> (String, 
                 }
                 // Logical instructions
                 "!" | "~" => match op {
+                    // Compiles as follows:
+                    //    [Compiled operand]
+                    //    movq [Operand], [temp register (rax)] <- able to use stack?
+                    //    testq [temp register], [temp register] <- sets flags: 1 if 0, 0 if not 0
+                    //    sete %al <- sets %al to 1 if the zero flag is set, 0 if not
+                    //    movzbq %al, [temp register] <- zero extends %al to %rax
+                    //    movq [temp register], [Operand]
                     "!" => {
                         if e.len() != 1 {
                             panic!("Expected 1 operand for !")
@@ -404,7 +427,7 @@ fn ast_to_asm_expr(expr: &minc_ast::Expr, env: Environment, v: i64) -> (String, 
                                     "\ttestq %rax, %rax",
                                     "\tsete %al",
                                     "\tmovzbq %al, %rax",
-                                    format!("\tmov %rax, {}(%rsp)", op)
+                                    format!("\tmovq %rax, {}(%rsp)", op)
                                 ),
                                 op,
                             )
@@ -416,6 +439,7 @@ fn ast_to_asm_expr(expr: &minc_ast::Expr, env: Environment, v: i64) -> (String, 
                         } else {
                             let (insns, op) = ast_to_asm_expr(&e[0], env, v);
                             (
+                                // bitwise not
                                 format!("{}\n{}\n", insns, format!("\tnotq {}(%rsp)", op)),
                                 op,
                             )
