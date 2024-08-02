@@ -268,33 +268,21 @@ fn ast_to_asm_expr(expr: &minc_ast::Expr, env: Environment, v: i64) -> (String, 
                         //    movq [Second operand], [Stack]
                         //    [Compiled first operand]
                         //    addq [Second operand in stack], [First operand]
-                        "+" => {
-                            // Compiles the second operand
-                            let (insns1, op1) = ast_to_asm_expr(&e[1], env.clone(), v);
-                            // Compiles the first operand
-                            // The second operand is compiled first to ensure that the result is stored in the first operand
-                            let (insns0, op0) = ast_to_asm_expr(&e[0], env, v + 8);
-                            // let m = format!("{}(%rsp)", v); // Where to copy the second operand
-                            (
-                                format!(
-                                    "{}\n{}\n{}\n{}\n",
-                                    insns1, // Compiles the second operand
-                                    // format!("\tmovq {}(%rsp), {}", op1, m), // Copies the second operand to the stack
-                                    format!("\tmovq {}(%rsp), %rax", op1),
-                                    insns0, // Compiles the first operand
-                                    // format!("\taddq {}, {}(%rsp)", m, op0) // Adds the first operand to the second operand
-                                    format!("\taddq %rax, {}(%rsp)", op0)
-                                ),
-                                op0, // The result is stored in the first operand
-                            )
-                        }
-                        "-" => {
-                            // For negative numbers
+                        "+" | "-" => {
+                            // For positive numbers
                             if e.len() == 1 {
                                 let (insns0, op0) = ast_to_asm_expr(&e[0], env, v);
                                 (
-                                    format!("{}\n{}\n", insns0, format!("\tnegq {}(%rsp)", op0)),
-                                    op0,
+                                    match op {
+                                        "+" => format!("{}\n", insns0),
+                                        "-" => format!(
+                                            "{}\n{}\n",
+                                            insns0,
+                                            format!("\tnegq {}(%rsp)", op0)
+                                        ),
+                                        _ => panic!("Unknown operator {}", op),
+                                    },
+                                    op0, // The result is stored in the first operand
                                 )
                             } else {
                                 // Compiles the second operand
@@ -302,18 +290,62 @@ fn ast_to_asm_expr(expr: &minc_ast::Expr, env: Environment, v: i64) -> (String, 
                                 // Compiles the first operand
                                 // The second operand is compiled first to ensure that the result is stored in the first operand
                                 let (insns0, op0) = ast_to_asm_expr(&e[0], env, v + 8);
-                                let m = format!("{}(%rsp)", v); // Where to copy the second operand
                                 (
                                     format!(
                                         "{}\n{}\n{}\n{}\n",
                                         insns1, // Compiles the second operand
-                                        format!("\tmovq {}, {}", op1, m), // Copies the second operand to the stack
+                                        format!("\tmovq {}(%rsp), %rax", op1),
                                         insns0, // Compiles the first operand
-                                        format!("\tsubq {}, {}", m, op0) // Subtracts the first operand from the second operand
+                                        match op {
+                                            "+" => format!("\taddq %rax, {}(%rsp)", op0),
+                                            "-" => format!("\tsubq %rax, {}(%rsp)", op0),
+                                            _ => panic!("Unknown operator {}", op),
+                                        }
                                     ),
                                     op0, // The result is stored in the first operand
                                 )
                             }
+                        }
+                        "*" => {
+                            // Compiles the second operand
+                            let (insns1, op1) = ast_to_asm_expr(&e[1], env.clone(), v);
+                            // Compiles the first operand
+                            // The second operand is compiled first to ensure that the result is stored in the first operand
+                            let (insns0, op0) = ast_to_asm_expr(&e[0], env, v + 8);
+                            (
+                                format!(
+                                    "{}\n{}\n{}\n{}\n{}\n",
+                                    insns1, // Compiles the second operand
+                                    format!("\tmovq {}(%rsp), %rax", op1),
+                                    insns0, // Compiles the first operand
+                                    format!("\tmulq {}(%rsp)", op0),
+                                    format!("\tmovq %rax, {}(%rsp)", op0),
+                                ),
+                                op0, // The result is stored in the first operand
+                            )
+                        }
+                        "/" | "%" => {
+                            // Compiles the second operand
+                            let (insns1, op1) = ast_to_asm_expr(&e[1], env.clone(), v);
+                            // Compiles the first operand
+                            // The second operand is compiled first to ensure that the result is stored in the first operand
+                            let (insns0, op0) = ast_to_asm_expr(&e[0], env, v + 8);
+                            (
+                                format!(
+                                    "{}\n{}\n{}\n{}\n{}\n{}\n",
+                                    insns1, // Compiles the second operand
+                                    insns0, // Compiles the first operand
+                                    format!("\tmovq {}(%rsp), %rax", op0),
+                                    format!("\txor %rdx, %rdx"),
+                                    format!("\tdivq {}(%rsp)", op1),
+                                    match op {
+                                        "/" => format!("\tmovq %rax, {}(%rsp)", op0),
+                                        "%" => format!("\tmovq %rdx, {}(%rsp)", op0),
+                                        _ => panic!("Unknown operator {}", op),
+                                    }
+                                ),
+                                op0, // The result is stored in the first operand
+                            )
                         }
                         _ => panic!("Unknown operator {}", op),
                     }
@@ -357,6 +389,40 @@ fn ast_to_asm_expr(expr: &minc_ast::Expr, env: Environment, v: i64) -> (String, 
                         _ => panic!("Unknown operator {}", op),
                     }
                 }
+                // Logical instructions
+                "!" | "~" => match op {
+                    "!" => {
+                        if e.len() != 1 {
+                            panic!("Expected 1 operand for !")
+                        } else {
+                            let (insns, op) = ast_to_asm_expr(&e[0], env, v);
+                            (
+                                format!(
+                                    "{}\n{}\n{}\n{}\n{}\n{}\n",
+                                    insns,
+                                    format!("\tmovq {}(%rsp), %rax", op),
+                                    "\ttestq %rax, %rax",
+                                    "\tsete %al",
+                                    "\tmovzbq %al, %rax",
+                                    format!("\tmov %rax, {}(%rsp)", op)
+                                ),
+                                op,
+                            )
+                        }
+                    }
+                    "~" => {
+                        if e.len() != 1 {
+                            panic!("Expected 1 operand for ~")
+                        } else {
+                            let (insns, op) = ast_to_asm_expr(&e[0], env, v);
+                            (
+                                format!("{}\n{}\n", insns, format!("\tnotq {}(%rsp)", op)),
+                                op,
+                            )
+                        }
+                    }
+                    _ => panic!("Unknown operator {}", op),
+                },
                 _ => panic!("Unknown operator {}", op),
             }
         }
