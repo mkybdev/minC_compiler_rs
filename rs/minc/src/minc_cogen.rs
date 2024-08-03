@@ -219,12 +219,9 @@ fn ast_to_asm_def(def: &minc_ast::Def, i: usize) -> String {
             // Generates the prologue
             // Returns the prologue, environment, and free registers
             let (prologue, env, mut free_regs, v) = gen_prologue(def, i);
-            format!(
-                "{}\n{}\n{}\n",
-                prologue,
-                ast_to_asm_stmt(body, env, v, &mut free_regs, &mut format!(".L{}0", i)), // Compiles the function body
-                gen_epilogue(def, i)
-            )
+            let body_insns =
+                ast_to_asm_stmt(body, env, v, &mut free_regs, &mut format!(".L{}0", i)); // Compiles the function body
+            format!("{}\n{}\n{}\n", prologue, body_insns, gen_epilogue(def, i))
         }
     }
 }
@@ -236,7 +233,7 @@ fn gen_prologue(def: &minc_ast::Def, i: usize) -> (String, Environment, Vec<Regi
     match def {
         minc_ast::Def::Fun(name, params, ..) => {
             // Save arguments to the environment
-            const GROWTH: i64 = 2;
+            const GROWTH: i64 = 100;
             let env = params
                 .iter()
                 .enumerate()
@@ -244,7 +241,7 @@ fn gen_prologue(def: &minc_ast::Def, i: usize) -> (String, Environment, Vec<Regi
                     let loc = if i < ARGS_REGS.len() {
                         Location::Register(ARGS_REGS[i])
                     } else {
-                        // offset for rbx, stack growth + offset for arguments
+                        // offset for rbp, stack growth + offset for arguments
                         Location::Stack(Stack::RSP(
                             (8 + 8 * GROWTH) + 8 * (i - ARGS_REGS.len() + 1) as i64,
                         ))
@@ -261,8 +258,8 @@ fn gen_prologue(def: &minc_ast::Def, i: usize) -> (String, Environment, Vec<Regi
                     format!(".LFB{}:", i),
                     ".cfi_startproc",
                     "endbr64",
-                    "pushq %rbx",                          // Save callee-save register
-                    "movq %rsp, %rbx",                     // Save stack pointer
+                    "pushq %rbp",                          // Save base pointer
+                    "movq %rsp, %rbp",                     // Save stack pointer
                     format!("subq ${}, %rsp", 8 * GROWTH)  // Grow stack
                 ),
                 env,
@@ -293,9 +290,10 @@ fn gen_epilogue(def: &minc_ast::Def, i: usize) -> String {
     match def {
         minc_ast::Def::Fun(name, ..) => {
             format!(
-                "\t{}\n\t{}\n\t{}\n\t{}\n{}\n\t{}\n",
-                "movq %rbx, %rsp", // Restore stack pointer
-                "popq %rbx",       // Restore callee-save register
+                "{}\n\t{}\n\t{}\n\t{}\n\t{}\n{}\n\t{}\n",
+                format!(".LR{}:", i),
+                "movq %rbp, %rsp", // Restore stack pointer
+                "popq %rbp",       // Restore callee-save register
                 "ret",
                 ".cfi_endproc",
                 format!(".LFE{}:", i),
@@ -342,12 +340,13 @@ fn ast_to_asm_stmt(
             //     movq [Expression], %rax
             let (insns, op) = ast_to_asm_expr(expr, env, v, regs); // Compiles the expression
             format!(
-                "{}\n{}\n",
+                "{}\n{}\n{}\n",
                 insns,
                 match op {
                     Register::RAX => format!(""),
                     _ => format!("\tmovq {}, %rax", op), // Moves the result to the return register
-                }
+                },
+                "\tjmp .LR0"
             )
         }
         minc_ast::Stmt::Expr(expr) => {
@@ -600,8 +599,8 @@ fn ast_to_asm_expr(
                     let (insns1, op1) = ast_to_asm_expr(&e[1], env.clone(), v, regs);
                     // Compiles the first operand
                     let (insns0, op0) = ast_to_asm_expr(&e[0], env, v + 8, regs);
-                    let m0 = Stack::RSP(v); // Where to copy the first operand
-                    let m1 = Stack::RSP(v + 8); // Where to copy the second operand
+                    let m0 = Stack::RSP(v + 8); // Where to copy the first operand
+                    let m1 = Stack::RSP(v); // Where to copy the second operand
                     regs.push(op0); // Adds the first operand to the free registers
                     regs.push(op1); // Adds the second operand to the free registers
                     (
@@ -724,7 +723,10 @@ fn ast_to_asm_expr(
                 }
                 _ => panic!("Function name must be an identifier"),
             }
-            (format!("{}\n{}", insns, call_insns), arg_vars[0])
+            (
+                format!("{}\n{}\n{}", insns, call_insns, "\tmovq %rax, %rbx"),
+                Register::RBX,
+            )
         }
         minc_ast::Expr::Paren(sub_expr) => (format!(""), Register::RAX),
     }
