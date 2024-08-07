@@ -1,19 +1,12 @@
 use crate::minc_ast;
+
+// fancy_regex: for regex pattern matching
 use fancy_regex::Regex;
 
-// Terminology:
-// BFS - offset value from the Beginning of the Free Space of the stack (not Breadth-First Search)
-// location - offset value of the variable address from the base pointer of the stack
-// scope - a block of code where variables are defined and used
-// _op - _operand
-// _insns - _instructions
+/// Defines the size of long integers.
+const LONG_SIZE: i64 = 8;
 
-#[allow(unreachable_code, unused_variables)]
 /// Takes a program.
-/// Concatenates the following in this order:
-///     Header,
-///     Individual function definitions,
-///     Trailer.
 /// Returns the concatenated string as the machine code of the program.
 pub fn ast_to_asm_program(_program: minc_ast::Program) -> String {
     let content = _program
@@ -23,16 +16,15 @@ pub fn ast_to_asm_program(_program: minc_ast::Program) -> String {
         .map(|(i, def)| ast_to_asm_def(def, i)) // Compiles each function definition
         .collect::<Vec<String>>()
         .join("\n");
+    // Concatenates the header, function definitions, and trailer
     format!("{}\n{}\n{}\n", header(), format_asm(content), trailer())
 }
 
-#[allow(unreachable_code, unused_variables)]
 /// Returns the header part of the machine code.
 fn header() -> String {
     format!("\t{}\n\t{}\n", ".file \"program.minc\"", ".text")
 }
 
-#[allow(unreachable_code, unused_variables)]
 /// Returns the trailer part of the machine code.
 fn trailer() -> String {
     format!(
@@ -41,8 +33,9 @@ fn trailer() -> String {
     )
 }
 
-#[allow(unreachable_code, unused_variables)]
-/// Formats the machine code.
+/// Formats the machine code in the following ways:
+///     Replaces multiple empty lines with a single empty line.
+/// Returns the formatted machine code.
 fn format_asm(asm: String) -> String {
     Regex::new(r"\n\s*\n\s*\n")
         .unwrap()
@@ -50,7 +43,7 @@ fn format_asm(asm: String) -> String {
         .to_string()
 }
 
-#[allow(unreachable_code, unused_variables, dead_code)]
+#[allow(dead_code)]
 #[derive(Copy, Clone, PartialEq)]
 /// Registers in x86-64.
 enum Register {
@@ -94,7 +87,7 @@ impl std::fmt::Display for Register {
     }
 }
 
-/// Register array for arguments.
+/// Array of argument registers.
 static ARGS_REGS: [Register; 6] = [
     Register::RDI,
     Register::RSI,
@@ -105,7 +98,7 @@ static ARGS_REGS: [Register; 6] = [
 ];
 
 #[allow(dead_code)]
-/// Register array for callee-save registers.
+/// Array of callee-save registers.
 static CALLEE_SAVE_REGS: [Register; 5] = [
     Register::RBX,
     Register::R12,
@@ -114,9 +107,9 @@ static CALLEE_SAVE_REGS: [Register; 5] = [
     Register::R15,
 ];
 
-#[allow(unreachable_code, unused_variables)]
 #[derive(Copy, Clone, PartialEq)]
 /// Stack representation.
+/// Holds the offset from the base pointer.
 enum Stack {
     RSP(i64),
 }
@@ -138,9 +131,9 @@ impl std::fmt::Display for Stack {
     }
 }
 
-#[allow(unreachable_code, unused_variables)]
 #[derive(Copy, Clone, PartialEq)]
 /// Location of variables and operands.
+/// For immediate values, the location is the value itself.
 enum Location {
     Register(Register),
     Stack(Stack),
@@ -158,17 +151,15 @@ impl std::fmt::Display for Location {
     }
 }
 
-#[allow(unreachable_code, unused_variables)]
 #[derive(Clone)]
 /// Environment for variables in a scope.
 struct Environment {
-    /// Map of variable names to their locations.
+    /// Maps variable names to their locations.
     env: std::collections::HashMap<String, Location>,
 }
 
-#[allow(unreachable_code, unused_variables)]
 impl Environment {
-    /// Returns a new environment.
+    /// Returns a new Environment.
     fn new() -> Environment {
         Environment {
             env: std::collections::HashMap::new(),
@@ -177,8 +168,8 @@ impl Environment {
 
     /// Takes a variable name.
     /// Returns the location of the variable in the environment if it exists.
-    fn lookup(&self, x: &str) -> Option<Location> {
-        let loc = self.env.get(x);
+    fn lookup(&self, name: &str) -> Option<Location> {
+        let loc = self.env.get(name);
         match loc {
             Some(loc) => Some(*loc),
             None => None,
@@ -186,38 +177,41 @@ impl Environment {
     }
 
     /// Takes a Location.
-    /// Returns whether there exists a variable mapped to the location.
-    fn contains(&self, loc: Location) -> bool {
+    /// Returns whether there exists a variable mapped to the location in the Environment.
+    fn contains_loc(&self, loc: Location) -> bool {
         self.env.values().any(|&l| l == loc)
+    }
+
+    /// Takes a variable name.
+    /// Returns whether the variable exists in the Environment.
+    fn contains_var(&self, name: &str) -> bool {
+        self.env.contains_key(name)
     }
 
     /// Takes a variable name and a location.
     /// Returns a new environment with the variable added.
-    fn add(&self, x: &str, loc: Location) -> Environment {
+    fn add(&self, name: &str, loc: Location) -> Environment {
         let mut env2 = Environment {
             env: self.env.clone(),
         };
         // Maps the variable name to the location
-        // This means that the shadowing of variables is not supported
-        env2.env.insert(x.to_string(), loc);
+        // Shadowing of variables is supported
+        env2.env.insert(name.to_string(), loc);
         env2
     }
 
-    /// Takes a list of variable declarations and a stack location.
-    /// Assigns locations (v, v+8, v+16, ...) to the variables declared in decls.
-    /// Returns a new environment with the variables added and the next stack location.
+    /// Takes variable declarations and a stack location.
+    /// Maps consecutive adjacent stack locations to the variables declared in decls.
+    /// Returns a new environment with the variables added and the next stack location offset.
     fn extend(&self, decls: &Vec<minc_ast::Decl>, loc: Stack) -> (Environment, i64) {
-        let env2 = Environment {
-            env: self.env.clone(),
-        };
-        // Iterates over the declarations
         match loc {
             Stack::RSP(loc) => {
-                decls.iter().fold((env2, loc), |(env, loc), decl| {
-                    // Adds the variable to the environment and increments BFS
+                // Iterates over the declarations
+                decls.iter().fold((self.clone(), loc), |(env, loc), decl| {
+                    // Adds the variable to the environment and increments the stack location offset
                     (
                         env.add(&decl.name, Location::Stack(Stack::RSP(loc))),
-                        loc + 8,
+                        loc + LONG_SIZE,
                     )
                 })
             }
@@ -225,366 +219,285 @@ impl Environment {
     }
 }
 
-#[allow(unreachable_code, unused_variables)]
-/// Takes a top-level definition.
-/// Concatenates the following in this order:
-///      Prologue (Grows stack, saves arguments),
-///      Function body,
-///      Epilogue (Shrinks stack, returns value).
-/// Returns the concatenated string as the machine code of the function definition.
-fn ast_to_asm_def(def: &minc_ast::Def, i: usize) -> String {
+/// Takes a top-level definition (and function number for now).
+/// Returns the machine code of the function definition.
+fn ast_to_asm_def(def: &minc_ast::Def, num: usize) -> String {
     // Always a function definition for now
     match def {
-        // Extracts the function name, parameters, return type, and body
-        minc_ast::Def::Fun(name, params, return_type, body) => {
-            // Generates the prologue
-            // Returns the prologue, environment, and free registers
-            let (prologue, env, mut free_regs, v) = gen_prologue(def, i);
-            let body_insns = ast_to_asm_stmt(
-                body,
-                env,
-                v,
-                &mut free_regs,
-                &mut format!(".L{}0", i),
-                &mut Location::Register(Register::RBX),
-            ); // Compiles the function body
-            format!("{}\n{}\n{}\n", prologue, body_insns, gen_epilogue(def, i))
+        // Extracts the function body
+        minc_ast::Def::Fun(.., body) => {
+            // Gets the prologue, environment, and stack offset
+            let (prologue, env, v) = gen_prologue(def, num);
+            // Compiles the function body
+            let body_insns = ast_to_asm_stmt(body, env, v, &mut format!(".L{}0", num));
+            // Gets the epilogue and concatenates the prologue, body, and epilogue
+            format!("{}\n{}\n{}\n", prologue, body_insns, gen_epilogue(def, num))
         }
     }
 }
 
-#[allow(unreachable_code, unused_variables)]
-/// Takes a definition.
-/// Returns the prologue part of the definition.
-fn gen_prologue(def: &minc_ast::Def, i: usize) -> (String, Environment, Vec<Register>, i64) {
+/// Takes a definition (and function number for now).
+/// Returns the prologue part of the definition, environment, and stack offset.
+fn gen_prologue(def: &minc_ast::Def, num: usize) -> (String, Environment, i64) {
+    // Always a function definition for now
     match def {
+        // Extracts the function name and parameters
         minc_ast::Def::Fun(name, params, ..) => {
-            // Save arguments to the environment
+            // Stack growth for arguments, local variables
+            // This is a meaningless number for now, which is left for future implementation
             const GROWTH: i64 = 100;
+            // Iterates over the parameters and adds them to the environment
             let env = params
                 .iter()
                 .enumerate()
                 .fold(Environment::new(), |env, (i, param)| {
                     let loc = if i < ARGS_REGS.len() {
+                        // Get the argument register specified by ABI
                         Location::Register(ARGS_REGS[i])
                     } else {
-                        // offset for rbp, stack growth + offset for arguments
+                        // Get the argument location on the stack
+                        // Offset is calculated based on the number of arguments and the stack growth
                         Location::Stack(Stack::RSP(
-                            (8 + 8 * GROWTH) + 8 * (i - ARGS_REGS.len() + 1) as i64,
+                            (LONG_SIZE + LONG_SIZE * GROWTH) // Callee-save register + stack growth
+                                + LONG_SIZE * (i - ARGS_REGS.len() + 1) as i64, // Spilled arguments
                         ))
-                    }; // Get the argument location
-                    env.add(&param.name, loc)
+                    };
+                    env.add(&param.name, loc) // Adds the parameter to the environment
                 })
-                .add(name, Location::Register(Register::RBP)); // Add the function name to the environment
+                .add(name, Location::Stack(Stack::RSP(0))); // Add the function itself to the environment
             (
+                // Prologue
                 format!(
                     "\t{}\n\t{}\n\t{}\n{}\n{}\n\t{}\n\t{}\n\t{}\n\t{}\n\t{}\n",
                     ".p2align 4",
                     format!(".globl {}", name),
                     format!(".type {}, @function", name),
                     format!("{}:", name),
-                    format!(".LFB{}:", i),
+                    format!(".LFB{}:", num), // Generates a function beginning label from the function number
                     ".cfi_startproc",
                     "endbr64",
-                    "pushq %rbp",                          // Save base pointer
-                    "movq %rsp, %rbp",                     // Save stack pointer
-                    format!("subq ${}, %rsp", 8 * GROWTH)  // Grow stack
+                    "pushq %rbp",      // Saves callee-save register
+                    "movq %rsp, %rbp", // Saves stack pointer
+                    format!("subq ${}, %rsp", LONG_SIZE * GROWTH)  // Grows stack
                 ),
-                env,
-                [
-                    vec![Register::RAX],
-                    if params.len() < ARGS_REGS.len() {
-                        ARGS_REGS[params.len()..].to_vec()
-                    } else {
-                        vec![]
-                    }, // Registers for arguments which are not used
-                    vec![Register::R10, Register::R11],
-                ]
-                .concat(),
-                if params.len() > ARGS_REGS.len() {
-                    (8 + 8 * GROWTH) + 8 * (params.len() - ARGS_REGS.len() + 1) as i64
-                } else {
-                    0
-                }, // BFS
+                env,       // Environment
+                LONG_SIZE, // Stack offset (for function itself)
             )
         }
     }
 }
 
-#[allow(unreachable_code, unused_variables)]
-/// Takes a definition.
+/// Takes a definition (and function number for now).
 /// Returns the epilogue part of the definition.
-fn gen_epilogue(def: &minc_ast::Def, i: usize) -> String {
+fn gen_epilogue(def: &minc_ast::Def, num: usize) -> String {
+    // Always a function definition for now
     match def {
+        // Extracts the function name
         minc_ast::Def::Fun(name, ..) => {
             format!(
                 "{}\n\t{}\n\t{}\n\t{}\n\t{}\n{}\n\t{}\n",
-                format!(".LR{}:", i),
-                "movq %rbp, %rsp", // Restore stack pointer
-                "popq %rbp",       // Restore callee-save register
+                format!(".LR{}:", num), // Generates a function return label from the function number
+                "movq %rbp, %rsp",      // Restores stack pointer
+                "popq %rbp",            // Restores callee-save register
                 "ret",
                 ".cfi_endproc",
-                format!(".LFE{}:", i),
+                format!(".LFE{}:", num), // Generates a function end label from the function number
                 format!(".size {}, .-{}", name, name)
             )
         }
     }
 }
 
-#[allow(unreachable_code, unused_variables)]
+/// Takes a label.
 /// Returns the next label.
 fn next_label(label: &mut String) -> String {
     let next = label.clone();
     *label = format!(
-        ".L{:0>2}",
+        ".L{:0>2}", // Generates a new label with a two-digit number
         label
             .chars()
             .skip(2)
             .collect::<String>()
             .parse::<i64>()
             .unwrap()
-            + 1
+            + 1  // Increments the label number
     );
-    next
+    next // Returns the next label
 }
 
-#[allow(unreachable_code, unused_variables)]
-/// Takes a statement, an environment, BFS, and free registers.
+/// Takes a statement, an environment, stack offset, and a label.
 /// Returns the machine code of the statement.
-fn ast_to_asm_stmt(
-    stmt: &minc_ast::Stmt,
-    env: Environment,
-    v: i64,
-    regs: &mut Vec<Register>,
-    label: &mut String,
-    csr: &mut Location,
-) -> String {
+fn ast_to_asm_stmt(stmt: &minc_ast::Stmt, env: Environment, v: i64, label: &mut String) -> String {
     match stmt {
         minc_ast::Stmt::Empty => format!(""),
         minc_ast::Stmt::Continue => format!(""),
         minc_ast::Stmt::Break => format!(""),
         minc_ast::Stmt::Return(expr) => {
-            // Compiles the return statement as follows:
-            //     [Compiled expression]
-            //     movq [Expression], %rax
-            let (insns, op) = ast_to_asm_expr(expr, env, v, regs, csr); // Compiles the expression
+            let (insns, op) = ast_to_asm_expr(expr, env, v); // Compiles the expression
             format!(
                 "{}\n{}\n{}\n",
-                insns,
+                insns, // Compiled expression
                 match op {
-                    Location::Register(Register::RAX) => format!(""),
-                    _ => format!("\tmovq {}, %rax", op), // Moves the result to the return register
+                    Location::Register(Register::RAX) => format!(""), // No need to move to %rax
+                    _ => format!("\tmovq {}, %rax", op),              // Moves the result to %rax
                 },
-                format!("\tjmp .LR{}", label.chars().collect::<Vec<char>>()[2])
+                format!("\tjmp .LR{}", label.chars().collect::<Vec<char>>()[2]) // Jumps to the return label
             )
         }
         minc_ast::Stmt::Expr(expr) => {
-            let (insns, op) = ast_to_asm_expr(expr, env, v, regs, csr); // Compiles the expression
-            format!("{}\n", insns)
+            // Compiles the expression statement
+            let (insns, _) = ast_to_asm_expr(expr, env, v); // Compiles the expression
+            format!("{}\n", insns) // Returns the compiled expression
         }
         minc_ast::Stmt::Compound(decls, stmts) => {
             // A new compound statement means a new scope
             // Extends the environment with the new variables
-            let (env2, v2) = env.extend(decls, Stack::RSP(v));
-            cogen_stmts(stmts, env2, v2, regs, label, csr) // Compiles the statements
+            let (env2, v2) = env.extend(decls, Stack::RSP(v)); // Extends the environment from the current stack offset
+            cogen_stmts(stmts, env2, v2, label) // Compiles the statements in the new scope
         }
         minc_ast::Stmt::If(cond, then_stmt, Some(else_stmt)) => {
-            // Compiles the if-else statement as follows:
-            //     [Compiled condition]
-            //     cmpq $0, [Condition]
-            //     je .Lc <- jump to else part if condition is false
-            //     [Compiled then statement]
-            //     jmp .Le
-            //     .Lc: <- else part
-            //          [Compiled else statement]
-            //     .Le:
-            let (cond_insns, cond_op) = ast_to_asm_expr(cond, env.clone(), v, regs, csr); // Compiles the condition
+            let (cond_insns, cond_op) = ast_to_asm_expr(cond, env.clone(), v); // Compiles the condition
             let label_lc = next_label(label);
             let label_le = next_label(label);
             format!(
                 "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
-                cond_insns,
-                format!("\tcmpq $0, {}", cond_op), // Compares the condition with 0
-                format!("\tje {}", label_lc),
-                ast_to_asm_stmt(then_stmt, env.clone(), v, regs, label, csr), // Compiles the then statement
-                format!("\tjmp {}", label_le),
-                format!("{}:", label_lc),
-                ast_to_asm_stmt(else_stmt, env, v, regs, label, csr), // Compiles the else statement
-                format!("{}:", label_le),
+                cond_insns,                                        // Compiled condition
+                format!("\tcmpq $0, {}", cond_op),                 // Compares the condition with 0
+                format!("\tje {}", label_lc), // Jumps to the else part if the condition is false
+                ast_to_asm_stmt(then_stmt, env.clone(), v, label), // Compiles the then statement
+                format!("\tjmp {}", label_le), // Jumps to the end
+                format!("{}:", label_lc),     // Else part
+                ast_to_asm_stmt(else_stmt, env, v, label), // Compiles the else statement
+                format!("{}:", label_le),     // End
             )
         }
         minc_ast::Stmt::If(cond, then_stmt, None) => {
-            // Compiles the if statement as follows:
-            //     [Compiled condition]
-            //     cmpq $0, [Condition]
-            //     je .Lc <- jump to end if condition is false
-            //     [Compiled then statement]
-            //     .Lc:
-            let (cond_insns, cond_op) = ast_to_asm_expr(cond, env.clone(), v, regs, csr); // Compiles the condition
+            let (cond_insns, cond_op) = ast_to_asm_expr(cond, env.clone(), v); // Compiles the condition
             let label_lc = next_label(label);
             format!(
                 "{}\n{}\n{}\n{}\n{}\n",
-                cond_insns,
-                format!("\tcmpq $0, {}", cond_op), // Compares the condition with 0
-                format!("\tje {}", label_lc),
-                ast_to_asm_stmt(then_stmt, env.clone(), v, regs, label, csr), // Compiles the then statement
-                format!("{}:", label_lc),
+                cond_insns,                                        // Compiled condition
+                format!("\tcmpq $0, {}", cond_op),                 // Compares the condition with 0
+                format!("\tje {}", label_lc), // Jumps to the end if the condition is false
+                ast_to_asm_stmt(then_stmt, env.clone(), v, label), // Compiles the then statement
+                format!("{}:", label_lc),     // End
             )
         }
         minc_ast::Stmt::While(cond, body) => {
-            // Compiles the while statement as follows:
-            //     jmp .Lc
-            //     .Ls:
-            //          [Compiled body]
-            //     .Lc:
-            //          [Compiled condition]
-            //          cmpq $0, [Condition]
-            //          jne .Ls
-            let (cond_insns, cond_op) = ast_to_asm_expr(cond, env.clone(), v, regs, csr); // Compiles the condition
+            let (cond_insns, cond_op) = ast_to_asm_expr(cond, env.clone(), v); // Compiles the condition
             let label_lc = next_label(label);
             let label_ls = next_label(label);
             format!(
                 "{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
-                format!("\tjmp {}", label_lc),
-                format!("{}:", label_ls),                        // Body part
-                ast_to_asm_stmt(body, env, v, regs, label, csr), // Compiles the body
-                format!("{}:", label_lc),                        // Condition part
-                cond_insns,
+                format!("\tjmp {}", label_lc), // Jumps to the condition part
+                format!("{}:", label_ls),      // Body part
+                ast_to_asm_stmt(body, env, v, label), // Compiles the body
+                format!("{}:", label_lc),      // Condition part
+                cond_insns,                    // Compiled condition
                 format!("\tcmpq $0, {}", cond_op), // Compares the condition with 0
-                format!("\tjne {}", label_ls),
+                format!("\tjne {}", label_ls), // Jumps to the body part if the condition is true
             )
         }
     }
 }
 
-#[allow(unreachable_code, unused_variables)]
-/// Takes a list of statements, an environment, and BFS.
+/// Takes a list of statements, an environment, stack offset, and a label.
 /// Returns the machine code of the statements.
 fn cogen_stmts(
     stmts: &Vec<minc_ast::Stmt>,
     env: Environment,
     v: i64,
-    regs: &mut Vec<Register>,
     label: &mut String,
-    csr: &mut Location,
 ) -> String {
+    // Iterates over the statements and compiles them
     stmts
         .iter()
-        .map(|stmt| ast_to_asm_stmt(stmt, env.clone(), v, regs, label, csr)) // Compiles each statement
+        .map(|stmt| ast_to_asm_stmt(stmt, env.clone(), v, label)) // Compiles each statement
         .collect::<Vec<String>>()
         .join("\n")
 }
 
-#[allow(unreachable_code, unused_variables, dead_code)]
-/// Returns the next callee-save register.
-fn next_callee_save_reg(loc: &mut Location) -> Location {
-    let next = loc.clone();
-    *loc = match next {
-        Location::Register(r) => {
-            if let Some(i) = CALLEE_SAVE_REGS.iter().position(|&x| x == r) {
-                if i + 1 != CALLEE_SAVE_REGS.len() {
-                    Location::Register(CALLEE_SAVE_REGS[i + 1])
-                } else {
-                    Location::Stack(Stack::RSP(0))
-                }
-            } else {
-                Location::Stack(Stack::RSP(0))
-            }
-        }
-        Location::Stack(Stack::RSP(v)) => Location::Stack(Stack::RSP(v + 8)),
-        _ => Location::Stack(Stack::RSP(0)),
-    };
-    next
-}
-
-#[allow(unreachable_code, unused_variables)]
-/// Takes an expression, an environment, BFS and free registers.
-/// Returns the machine code of the expression and the location of the result.
-fn ast_to_asm_expr(
-    expr: &minc_ast::Expr,
-    env: Environment,
-    v: i64,
-    regs: &mut Vec<Register>,
-    csr: &mut Location,
-) -> (String, Location) {
+/// Takes an expression, an environment, and stack offset.
+/// Returns the machine code of the expression and the location of the evaluation result.
+fn ast_to_asm_expr(expr: &minc_ast::Expr, env: Environment, v: i64) -> (String, Location) {
     match expr {
+        // Integer literal
         minc_ast::Expr::IntLiteral(n) => {
             (format!(""), Location::Immediate(*n)) // Returns the integer literal
         }
-        minc_ast::Expr::Id(x) => {
-            // If the variable is found in the environment
-            if let Some(loc) = env.lookup(x) {
+        // Variable (Identifier)
+        minc_ast::Expr::Id(name) => {
+            if let Some(loc) = env.lookup(name) {
+                // If the variable is found in the environment
                 (format!(""), loc) // Returns the location of the variable
             } else {
-                panic!("Variable {} not found", x)
+                panic!("Variable {} not found", name)
             }
         }
+        // Unary/Binary operator expression
+        // Extracts the operator and operands
         minc_ast::Expr::Op(op, e) => {
             let op = op.as_str();
             match op {
                 // Arithmetic instructions
                 "+" | "-" | "*" | "/" | "%" => {
                     match op {
-                        // Compiles as follows:
-                        //    [Compiled second operand]
-                        //    movq [Second operand], [Stack]
-                        //    [Compiled first operand]
-                        //    addq/subq [Second operand in stack], [First operand]
                         "+" | "-" => {
-                            // For positive/negative numbers
+                            // For unary operators
                             if e.len() == 1 {
                                 // Compiles the operand
-                                let (insns0, op0) = ast_to_asm_expr(&e[0], env, v, regs, csr);
+                                let (insns0, op0) = ast_to_asm_expr(&e[0], env, v);
                                 match op0 {
+                                    // If the operand is an immediate value
                                     Location::Immediate(n) => (
-                                        format!(""),
+                                        format!(""), // No instructions
                                         match op {
-                                            "+" => op0,
-                                            "-" => Location::Immediate(-n),
+                                            "+" => op0,                     // The result is the operand itself
+                                            "-" => Location::Immediate(-n), // Negates the number
                                             _ => panic!("Unknown operator {}", op),
                                         },
                                     ),
                                     _ => (
                                         match op {
-                                            "+" => format!("{}\n", insns0),
+                                            "+" => format!("{}\n", insns0), // Compiled operand
                                             "-" => format!(
                                                 "{}\n{}\n",
-                                                insns0,
-                                                format!("\tnegq {}", op0) // Negates the number
+                                                insns0,                    // Compiled operand
+                                                format!("\tnegq {}", op0)  // Negates the number
                                             ),
                                             _ => panic!("Unknown operator {}", op),
                                         },
-                                        op0, // The result is stored in the first operand
+                                        op0, // The result is stored in the operand
                                     ),
                                 }
                             } else {
                                 // Compiles the second operand
-                                let (insns1, op1) =
-                                    ast_to_asm_expr(&e[1], env.clone(), v, regs, csr);
+                                let (insns1, op1) = ast_to_asm_expr(&e[1], env.clone(), v);
                                 // Compiles the first operand
-                                // The second operand is compiled first to ensure that the result is stored in the first operand
-                                let (insns0, op0) = ast_to_asm_expr(&e[0], env, v + 8, regs, csr);
+                                let (insns0, op0) = ast_to_asm_expr(&e[0], env, v + LONG_SIZE);
                                 match (op0, op1) {
+                                    // If both operands are immediate values
                                     (Location::Immediate(n0), Location::Immediate(n1)) => (
-                                        format!(""),
+                                        format!(""), // No instructions
                                         Location::Immediate(match op {
-                                            "+" => n0 + n1,
-                                            "-" => n0 - n1,
+                                            "+" => n0 + n1, // Adds the numbers
+                                            "-" => n0 - n1, // Subtracts the numbers
                                             _ => panic!("Unknown operator {}", op),
                                         }),
                                     ),
+                                    // If the first operand is an immediate value
                                     (Location::Immediate(n0), _) => {
                                         let m = Stack::RSP(v); // Where to copy the second operand
                                         (
                                             format!(
                                                 "{}\n{}\n{}\n{}",
-                                                insns1,
+                                                insns1, // Compiled second operand
                                                 match op1 {
                                                     Location::Stack(_) =>
                                                         format!("\tpushq {}\n\tpopq {}", op1, m),
                                                     _ => format!("\tmovq {}, {}", op1, m),
-                                                },
-                                                insns0,
+                                                }, // Copies the second operand to the stack
+                                                insns0, // Compiled first operand
                                                 match op {
                                                     "+" => format!("\taddq ${}, {}", n0, m),
                                                     "-" => format!(
@@ -592,114 +505,104 @@ fn ast_to_asm_expr(
                                                         n0, m, m
                                                     ),
                                                     _ => panic!("Unknown operator {}", op),
-                                                }
+                                                }  // Adds or subtracts the numbers
                                             ),
                                             Location::Stack(m),
                                         )
                                     }
+                                    // If the second operand is an immediate value
                                     (_, Location::Immediate(n1)) => {
-                                        let m = Stack::RSP(v);
+                                        let m = Stack::RSP(v); // Where to copy the first operand
                                         (
                                             format!(
                                                 "{}\n{}\n{}\n{}",
-                                                insns1,
-                                                insns0,
+                                                insns1, // Compiled second operand
+                                                insns0, // Compiled first operand
                                                 match op0 {
                                                     Location::Stack(_) =>
                                                         format!("\tpushq {}\n\tpopq {}", op0, m),
                                                     _ => format!("\tmovq {}, {}", op0, m),
-                                                },
+                                                }, // Copies the first operand to the stack
                                                 match op {
                                                     "+" => format!("\taddq ${}, {}", n1, m),
                                                     "-" => format!("\tsubq ${}, {}", n1, m),
                                                     _ => panic!("Unknown operator {}", op),
-                                                }
+                                                }  // Adds or subtracts the numbers
                                             ),
                                             Location::Stack(m),
                                         )
                                     }
+                                    // If both operands are not immediate values
                                     _ => {
-                                        let m = Stack::RSP(v); // Where to copy %rax
+                                        let m = Stack::RSP(v); // Where to copy the second operand
                                         (
                                             format!(
-                                                "{}\n{}\n{}\n{}\n{}\n{}\n",
-                                                insns1, // Compiles the second operand
-                                                format!("\tpushq {}", op1),
-                                                format!("\tpopq {}", m),
-                                                insns0, // Compiles the first operand
-                                                format!("\tmovq {}, %rax", op0),
+                                                "{}\n{}\n{}\n{}\n{}\n",
+                                                insns1, // Compiled second operand
+                                                match op1 {
+                                                    Location::Stack(_) =>
+                                                        format!("\tpushq {}\n\tpopq {}", op1, m),
+                                                    _ => format!("\tmovq {}, {}", op1, m),
+                                                }, // Copies the second operand to the stack
+                                                insns0, // Compiled first operand
+                                                format!("\tmovq {}, %rax", op0), // Moves the first operand to %rax
                                                 match op {
                                                     "+" => format!("\taddq {}, %rax", m),
                                                     "-" => format!("\tsubq {}, %rax", m),
                                                     _ => panic!("Unknown operator {}", op),
-                                                },
+                                                }, // Adds or subtracts the numbers
                                             ),
-                                            Location::Register(Register::RAX), // The result is stored in rax
+                                            Location::Register(Register::RAX), // The result is stored in %rax
                                         )
                                     }
                                 }
                             }
                         }
-                        // Compiles as follows:
-                        //    [Compiled second operand]
-                        //    movq [Second operand], [Stack]
-                        //    [Compiled first operand]
-                        //    movq [First operand], %rax
-                        //    mulq [Second operand in stack] <- result in rax
                         "*" => {
                             // Compiles the second operand
-                            let (insns1, op1) = ast_to_asm_expr(&e[1], env.clone(), v, regs, csr);
+                            let (insns1, op1) = ast_to_asm_expr(&e[1], env.clone(), v);
                             // Compiles the first operand
-                            // The second operand is compiled first to ensure that the result is stored in the first operand
-                            let (insns0, op0) = ast_to_asm_expr(&e[0], env, v + 8, regs, csr);
-                            let m = Stack::RSP(v); // Where to copy the first operand or %rax
+                            let (insns0, op0) = ast_to_asm_expr(&e[0], env, v + LONG_SIZE);
+                            let m = Stack::RSP(v); // Where to copy the second operand
                             (
                                 format!(
                                     "{}\n{}\n{}\n{}\n{}\n",
-                                    insns1, // Compiles the second operand
+                                    insns1, // Compiled second operand
                                     match op1 {
                                         Location::Stack(_) =>
                                             format!("\tpushq {}\n\tpopq {}", op1, m),
                                         _ => format!("\tmovq {}, {}", op1, m),
-                                    },
-                                    insns0, // Compiles the first operand
-                                    format!("\tmovq {}, %rax", op0),
-                                    format!("\tmulq {}", m),
+                                    }, // Copies the second operand to the stack
+                                    insns0, // Compiled first operand
+                                    format!("\tmovq {}, %rax", op0), // Moves the first operand to %rax
+                                    format!("\tmulq {}", m),         // Multiplies the numbers
                                 ),
-                                Location::Register(Register::RAX), // The result is stored in rax
+                                Location::Register(Register::RAX), // The result is stored in %rax
                             )
                         }
-                        // Compiles as follows:
-                        //    [Compiled second operand]
-                        //    movq [Second operand], [Stack]
-                        //    [Compiled first operand]
-                        //    movq [First operand], %rax
-                        //    xor %rdx, %rdx <- clear rdx
-                        //    divq [Second operand in stack] <- result in rax, remainder in rdx
                         "/" | "%" => {
                             // Compiles the second operand
-                            let (insns1, op1) = ast_to_asm_expr(&e[1], env.clone(), v, regs, csr);
+                            let (insns1, op1) = ast_to_asm_expr(&e[1], env.clone(), v);
                             // Compiles the first operand
-                            // The second operand is compiled first to ensure that the result is stored in the first operand
-                            let (insns0, op0) = ast_to_asm_expr(&e[0], env, v + 8, regs, csr);
-                            let m = Stack::RSP(v); // Where to copy the first operand
+                            let (insns0, op0) = ast_to_asm_expr(&e[0], env, v + LONG_SIZE);
+                            let m = Stack::RSP(v); // Where to copy the second operand
                             (
                                 format!(
                                     "{}\n{}\n{}\n{}\n{}\n{}\n",
-                                    insns1, // Compiles the second operand
+                                    insns1, // Compiled second operand
                                     match op1 {
                                         Location::Stack(_) =>
                                             format!("\tpushq {}\n\tpopq {}", op1, m),
                                         _ => format!("\tmovq {}, {}", op1, m),
-                                    },
-                                    insns0, // Compiles the first operand
-                                    format!("\tmovq {}, %rax", op0),
-                                    format!("\txor %rdx, %rdx"),
-                                    format!("\tdivq {}", m),
+                                    }, // Copies the second operand to the stack
+                                    insns0, // Compiled first operand
+                                    format!("\tmovq {}, %rax", op0), // Moves the first operand to %rax
+                                    format!("\txor %rdx, %rdx"),     // Clears %rdx
+                                    format!("\tdivq {}", m),         // Divides the numbers
                                 ),
                                 match op {
-                                    "/" => Location::Register(Register::RAX), // The result is stored in rax
-                                    "%" => Location::Register(Register::RDX), // The result is stored in rdx
+                                    "/" => Location::Register(Register::RAX), // The quotient is stored in %rax
+                                    "%" => Location::Register(Register::RDX), // The remainder is stored in %rdx
                                     _ => panic!("Unknown operator {}", op),
                                 },
                             )
@@ -708,37 +611,27 @@ fn ast_to_asm_expr(
                     }
                 }
                 // Comparison instructions
-                // Compiles as follows:
-                //    [Compiled second operand]
-                //    movq [Second operand], [Stack]
-                //    [Compiled first operand]
-                //    movq [First operand], [Stack]
-                //    movq $0, %rax
-                //    movq [First operand in stack], [First operand]
-                //    cmpq [Second operand in stack], [First operand]
-                //    setl/setle/setg/setge/sete/setne %al
-                //    movzbq %al, %rax <- zero extends %al to %rax
                 "<" | "<=" | ">" | ">=" | "==" | "!=" => {
                     // Compiles the second operand
-                    let (insns1, op1) = ast_to_asm_expr(&e[1], env.clone(), v, regs, csr);
+                    let (insns1, op1) = ast_to_asm_expr(&e[1], env.clone(), v);
                     // Compiles the first operand
-                    let (insns0, op0) = ast_to_asm_expr(&e[0], env, v + 8, regs, csr);
-                    let m0 = Stack::RSP(v + 8); // Where to copy the first operand
+                    let (insns0, op0) = ast_to_asm_expr(&e[0], env, v + LONG_SIZE);
+                    let m0 = Stack::RSP(v + LONG_SIZE); // Where to copy the first operand
                     let m1 = Stack::RSP(v); // Where to copy the second operand
                     (
                         format!(
                             "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
-                            insns1,
+                            insns1, // Compiled second operand
                             match op1 {
                                 Location::Stack(_) => format!("\tpushq {}\n\tpopq {}", op1, m1),
                                 _ => format!("\tmovq {}, {}", op1, m1),
                             }, // Copies the second operand to the stack
-                            insns0,
+                            insns0, // Compiled first operand
                             match op0 {
                                 Location::Stack(_) => format!("\tpushq {}\n\tpopq {}", op0, m0),
                                 _ => format!("\tmovq {}, {}", op0, m0),
                             }, // Copies the first operand to the stack
-                            "\tmovq $0, %rax", // Initializes the result to 0
+                            "\txor %rax, %rax", // Clears %rax
                             format!("\tmovq {}, %rax", m0), // Restores the first operand
                             format!("\tcmpq {}, %rax", m1), // Compares the first and second operands
                             // Sets the result to 1 if the condition is true, 0 if not
@@ -751,55 +644,42 @@ fn ast_to_asm_expr(
                                 "!=" => "\tsetne %al",
                                 _ => panic!("Unknown operator {}", op),
                             },
-                            "\tmovzbq %al, %rax",
+                            "\tmovzbq %al, %rax", // Zero extends %al to %rax
                         ),
-                        Location::Register(Register::RAX), // The result is stored in rax
+                        Location::Register(Register::RAX), // The result is stored in %rax
                     )
                 }
                 // Logical instructions
                 "!" | "~" => match op {
-                    // Compiles as follows:
-                    //    [Compiled operand]
-                    //    testq [Operand], [Operand] <- sets flags: 1 if 0, 0 if not 0
-                    //    sete %al <- sets %al to 1 if the zero flag is set, 0 if not
-                    //    movzbq %al, %rax <- zero extends %al to %rax
                     "!" => {
                         if e.len() != 1 {
                             panic!("Expected 1 operand for !")
                         } else {
-                            let (insns, op) = ast_to_asm_expr(&e[0], env, v, regs, csr);
-                            match op {
-                                Location::Register(r) => regs.push(r), // Adds the operand to the free registers
-                                _ => {}
-                            }
+                            // Compiles the operand
+                            let (insns, op) = ast_to_asm_expr(&e[0], env, v);
                             (
                                 format!(
                                     "{}\n{}\n{}\n{}\n",
-                                    insns,
-                                    format!("\ttestq {}, {}", op, op),
-                                    "\tsete %al",
-                                    "\tmovzbq %al, %rax",
+                                    insns,                             // Compiled operand
+                                    format!("\ttestq {}, {}", op, op), // If the operand is 0, sets ZF to 1
+                                    "\tsete %al",                      // Sets %al to 1 if ZF is set
+                                    "\tmovzbq %al, %rax",              // Zero extends %al to %rax
                                 ),
-                                Location::Register(Register::RAX),
+                                Location::Register(Register::RAX), // The result is stored in %rax
                             )
                         }
                     }
                     // Compiles as follows:
-                    //    [Compiled operand]
-                    //    notq [Operand]
                     "~" => {
                         if e.len() != 1 {
                             panic!("Expected 1 operand for ~")
                         } else {
-                            let (insns, op) = ast_to_asm_expr(&e[0], env, v, regs, csr);
-                            match op {
-                                Location::Register(r) => regs.push(r), // Adds the operand to the free registers
-                                _ => {}
-                            }
+                            // Compiles the operand
+                            let (insns, op) = ast_to_asm_expr(&e[0], env, v);
                             (
-                                // bitwise not
+                                // Bitwise not
                                 format!("{}\n{}\n", insns, format!("\tnotq {}", op)),
-                                op,
+                                op, // The result is stored in the operand
                             )
                         }
                     }
@@ -811,7 +691,7 @@ fn ast_to_asm_expr(
                         panic!("Expected 2 operands for =")
                     } else {
                         // Compiles the second operand
-                        let (insns1, op1) = ast_to_asm_expr(&e[1], env.clone(), v, regs, csr);
+                        let (insns1, op1) = ast_to_asm_expr(&e[1], env.clone(), v);
                         // Get the location of the first operand
                         if let minc_ast::Expr::Id(x) = &e[0] {
                             // If the variable is found in the environment
@@ -819,12 +699,12 @@ fn ast_to_asm_expr(
                                 (
                                     format!(
                                         "{}\n{}\n",
-                                        insns1,
+                                        insns1, // Compiled second operand
                                         match op1 {
                                             Location::Stack(_) =>
                                                 format!("\tpushq {}\n\tpopq {}", op1, loc),
                                             _ => format!("\tmovq {}, {}", op1, loc),
-                                        },
+                                        }, // Moves the second operand to the first operand
                                     ),
                                     Location::Register(Register::RAX),
                                 )
@@ -839,103 +719,112 @@ fn ast_to_asm_expr(
                 _ => panic!("Unknown operator {}", op),
             }
         }
+        // Function call
+        // Extracts the function name and arguments
         minc_ast::Expr::Call(f, args) => {
             // Compiles the arguments
-            let (insns, arg_vars) = ast_to_asm_exprs(args, env.clone(), v, regs, csr);
-
+            let (insns, arg_vars) = ast_to_asm_exprs(args, env.clone(), v);
             // Get function name
             match &**f {
-                minc_ast::Expr::Id(name) => {
-                    let recursive = if let Some(_) = env.lookup(name) {
-                        true
-                    } else {
-                        false
-                    };
-                    (
-                        format!(
-                            "{}\n{}\n",
-                            insns,
-                            make_call(name.to_string(), arg_vars, env, v, recursive)
-                        ),
-                        Location::Register(Register::RAX),
-                    )
-                }
+                minc_ast::Expr::Id(name) => (
+                    format!(
+                        "{}\n{}\n",
+                        insns, // Compiled arguments
+                        make_call(
+                            name.to_string(),
+                            arg_vars,
+                            env.clone(),
+                            v,
+                            env.contains_var(name) // Recursive if the environment contains the function itself
+                        )  // Get the function call instructions
+                    ),
+                    Location::Register(Register::RAX), // The result (return value) is stored in %rax
+                ),
+
                 _ => panic!("Function name must be an identifier"),
             }
         }
+        // Parenthesized expression
         minc_ast::Expr::Paren(sub_expr) => {
-            ast_to_asm_expr(sub_expr, env, v, regs, csr) // Compiles the sub-expression
+            ast_to_asm_expr(sub_expr, env, v) // Compiles the sub-expression
         }
     }
 }
 
-#[allow(unreachable_code, unused_variables, dead_code)]
-/// Returns the machine code of the expressions and the locations of the results.
+/// Takes expressions, an environment, and stack offset.
+/// Returns the machine code of the expressions and the locations of the evaluation results.
 fn ast_to_asm_exprs(
     args: &Vec<minc_ast::Expr>,
     env: Environment,
     v: i64,
-    regs: &mut Vec<Register>,
-    csr: &mut Location,
 ) -> (String, Vec<Location>) {
-    let mut insns_res: Vec<String> = vec![];
-    let mut locs: Vec<Location> = vec![];
-    for (i, arg) in args.iter().enumerate() {
-        let (insns, op) = ast_to_asm_expr(arg, env.clone(), v + i as i64 * 8, regs, csr);
-        insns_res.push(insns);
-        locs.push(op);
-    }
-    (insns_res.join("\n"), locs)
+    // Iterates over the expressions and compiles them
+    args.iter()
+        .enumerate()
+        .map(|(i, arg)| ast_to_asm_expr(arg, env.clone(), v + i as i64 * LONG_SIZE))
+        .fold(
+            (String::new(), vec![]),
+            |(insns_res, mut locs), (insns, op)| {
+                locs.push(op); // Adds the location of the evaluation result
+                (format!("{}\n{}", insns_res, insns), locs) // Returns the concatenated compiled expressions and locations
+            },
+        ) // Returns the compiled expressions and locations
 }
 
-#[allow(unreachable_code, unused_variables)]
-/// Put the arguments in the right registers specified by ABI
-/// If the registers are already used as local variables, puts them on the stack
-/// After calling function, pop the variables from the stack
+/// Takes a function name, arguments, an environment, stack offset, and whether the function is recursive.
+/// Returns the machine code of the function call.
 fn make_call(f: String, args: Vec<Location>, env: Environment, v: i64, recursive: bool) -> String {
-    let mut call_insns = String::new();
-    let mut offset = 0;
-    let mut stacked: Vec<Location> = vec![];
-    let mut to_copied: Vec<(Location, Location, i64)> = vec![];
-    let mut to_passed: Vec<(Location, Location)> = vec![];
+    let mut call_insns = String::new(); // Function call instructions
+    let mut stacked: Vec<Location> = vec![]; // Locations mapped to local variables
+    let mut to_copied: Vec<(Location, Location, i64)> = vec![]; // Locations to be copied
+    let mut to_passed: Vec<(Location, Location)> = vec![]; // Locations to be passed
     for (i, arg_var) in args.iter().enumerate() {
+        // Get the ith argument location specified by ABI
         let arg_pos: Location = if i < ARGS_REGS.len() {
             Location::Register(ARGS_REGS[i])
         } else {
-            Location::Stack(Stack::RSP(8 * (i - ARGS_REGS.len() + 1) as i64))
+            Location::Stack(Stack::RSP(LONG_SIZE * (i - ARGS_REGS.len() + 1) as i64))
         };
-        if env.contains(arg_pos) {
-            stacked.push(arg_pos);
-            offset += 8;
-            call_insns.push_str(&format!("\tpushq {}\n", arg_pos));
+        // If the locations are already mapped to local variables
+        if env.contains_loc(arg_pos) {
+            call_insns.push_str(&format!("\tpushq {}\n", arg_pos)); // Pushes the locations to the stack
+            stacked.push(arg_pos); // Adds the pushed location
         }
-        to_copied.push((arg_var.clone(), arg_pos, v + 8 * i as i64));
+        // Adds the locations to be copied
+        to_copied.push((arg_var.clone(), arg_pos, v + LONG_SIZE * i as i64));
     }
+    // Copies the locations to be passed (destroyed) to the stack
     for (from, to, loc) in to_copied.iter() {
-        let m = Location::Stack(Stack::RSP(*loc + 8 * stacked.len() as i64));
-        let tmp = match from {
+        // Get the location to be copied
+        // If there are stacked locations, adds that amount of space
+        let m = Location::Stack(Stack::RSP(*loc + LONG_SIZE * stacked.len() as i64));
+        let copy_insns = match from {
             Location::Stack(Stack::RSP(v2)) => format!(
                 "\tpushq {}\n\tpopq {}\n",
-                Stack::RSP(v2 + 8 * stacked.len() as i64),
+                Stack::RSP(v2 + LONG_SIZE * stacked.len() as i64), // Adds the stacked locations offset
                 m
             ),
             _ => format!("\tmovq {}, {}\n", from, m),
-        };
-        call_insns.push_str(&tmp);
-        to_passed.push((m, *to));
+        }; // Copies the location to the stack
+        call_insns.push_str(&copy_insns);
+        // Finally, the source location is the copied location
+        to_passed.push((m, *to)); // Adds the copied location and the destination location (argument)
     }
     for (from, to) in to_passed.iter() {
+        // Moves the locations to be passed to the argument locations
         call_insns.push_str(&format!("\tpushq {}\n\tpopq {}\n", from, to));
     }
+    // If not recursive, adds and subtracts the stack pointer for return address
     if !recursive {
-        call_insns.push_str(&format!("\taddq $8, %rsp\n"));
+        call_insns.push_str(&format!("\taddq ${}, %rsp\n", LONG_SIZE));
     }
-    call_insns.push_str(&format!("\tcall {}\n", f));
+    call_insns.push_str(&format!("\tcall {}\n", f)); // Calls the function
     if !recursive {
-        call_insns.push_str(&format!("\tsubq $8, %rsp\n"));
+        call_insns.push_str(&format!("\tsubq ${}, %rsp\n", LONG_SIZE));
     }
+    // Pops the locations mapped to local variables from the stack
     for arg_pos in stacked.iter().rev() {
         call_insns.push_str(&format!("\tpopq {}\n", arg_pos));
     }
-    call_insns
+    call_insns // Returns the function call instructions
 }
