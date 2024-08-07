@@ -1,4 +1,5 @@
 use crate::minc_ast;
+use regex::Regex;
 
 // Terminology:
 // BFS - offset value from the Beginning of the Free Space of the stack (not Breadth-First Search)
@@ -15,18 +16,14 @@ use crate::minc_ast;
 ///     Trailer.
 /// Returns the concatenated string as the machine code of the program.
 pub fn ast_to_asm_program(_program: minc_ast::Program) -> String {
-    format!(
-        "{}\n{}\n{}\n",
-        header(),
-        _program
-            .defs
-            .iter()
-            .enumerate()
-            .map(|(i, def)| ast_to_asm_def(def, i)) // Compiles each function definition
-            .collect::<Vec<String>>()
-            .join("\n"),
-        trailer()
-    )
+    let content = _program
+        .defs
+        .iter()
+        .enumerate()
+        .map(|(i, def)| ast_to_asm_def(def, i)) // Compiles each function definition
+        .collect::<Vec<String>>()
+        .join("\n");
+    format!("{}\n{}\n{}\n", header(), format_asm(content), trailer())
 }
 
 #[allow(unreachable_code, unused_variables)]
@@ -42,6 +39,13 @@ fn trailer() -> String {
         "\t{}\n\t{}",
         ".ident \"MCC\"", ".section .note.GNU-stack,\"\",@progbits"
     )
+}
+
+#[allow(unreachable_code, unused_variables)]
+/// Formats the machine code.
+fn format_asm(asm: String) -> String {
+    let re = Regex::new(r"\n\n\n+").unwrap();
+    re.replace_all(&asm, "\n\n").to_string()
 }
 
 #[allow(unreachable_code, unused_variables, dead_code)]
@@ -570,20 +574,32 @@ fn ast_to_asm_expr(
                                         let m = Stack::RSP(v); // Where to copy the second operand
                                         (
                                             format!(
-                                                "{}\n{}\n{}\n{}",
+                                                // "{}\n{}\n{}\n{}",
+                                                // insns1,
+                                                // format!("\tmovq {}, {}", op1, m),
+                                                // insns0,
+                                                // match op {
+                                                //     "+" => format!("\taddq ${}, {}", n0, m),
+                                                //     "-" => format!(
+                                                //         "\tsubq ${}, {}\n\tnegq {}",
+                                                //         n0, m, m
+                                                //     ),
+                                                //     _ => panic!("Unknown operator {}", op),
+                                                // }
+                                                "{}\n{}\n{}",
                                                 insns1,
-                                                format!("\tmovq ${}, {}", op1, m),
                                                 insns0,
                                                 match op {
-                                                    "+" => format!("\taddq ${}, {}", n0, m),
+                                                    "+" => format!("\taddq ${}, {}", n0, op1),
                                                     "-" => format!(
                                                         "\tsubq ${}, {}\n\tnegq {}",
-                                                        n0, m, m
+                                                        n0, op1, op1
                                                     ),
                                                     _ => panic!("Unknown operator {}", op),
                                                 }
                                             ),
-                                            Location::Stack(m),
+                                            // Location::Stack(m),
+                                            op1
                                         )
                                     }
                                     (_, Location::Immediate(n1)) => (
@@ -897,7 +913,7 @@ fn ast_to_asm_expr(
                     format!(
                         "{}\n{}\n",
                         insns,
-                        make_call(name.to_string(), arg_vars, env)
+                        make_call(name.to_string(), arg_vars, env, v)
                     ),
                     Location::Register(Register::RAX),
                 ),
@@ -933,24 +949,47 @@ fn ast_to_asm_exprs(
 /// Put the arguments in the right registers specified by ABI
 /// If the registers are already used as local variables, puts them on the stack
 /// After calling function, pop the variables from the stack
-fn make_call(f: String, args: Vec<Location>, env: Environment) -> String {
+fn make_call(f: String, args: Vec<Location>, env: Environment, v: i64) -> String {
     let mut call_insns = String::new();
+    let mut offset = 0;
     let mut stacked: Vec<Location> = vec![];
+    let mut to_copied: Vec<(Location, Location, i64)> = vec![];
+    let mut to_passed: Vec<(Location, Location)> = vec![];
     for (i, arg_var) in args.iter().enumerate() {
         let arg_pos: Location = if i < ARGS_REGS.len() {
             Location::Register(ARGS_REGS[i])
         } else {
-            let offset = 8 * (i - ARGS_REGS.len() + 1) as i64;
-            Location::Stack(Stack::RSP(offset))
+            Location::Stack(Stack::RSP(8 * (i - ARGS_REGS.len() + 1) as i64))
         };
         if env.contains(arg_pos) {
             stacked.push(arg_pos);
+            offset += 8;
             call_insns.push_str(&format!("\tpushq {}\n", arg_pos));
         }
-        call_insns.push_str(&format!("\tmovq {}, {}\n", arg_var, format!("{}", arg_pos)));
+        to_copied.push((arg_var.clone(), arg_pos, v + 8 * i as i64));
     }
+    for (from, to, loc) in to_copied.iter() {
+        let m = Location::Stack(Stack::RSP(*loc + 8 * stacked.len() as i64));
+        let tmp = match from {
+            Location::Stack(Stack::RSP(v2)) => format!(
+                "\tpushq {}\n\tpopq {}\n",
+                Stack::RSP(v2 + 8 * stacked.len() as i64),
+                m
+            ),
+            _ => format!("\tmovq {}, {}\n", from, m),
+        };
+        call_insns.push_str(&tmp);
+        to_passed.push((m, *to));
+    }
+    for (from, to) in to_passed.iter() {
+        call_insns.push_str(&format!("\tpushq {}\n\tpopq {}\n", from, to));
+    }
+    call_insns.push_str(&format!("\taddq $8, %rsp\n"));
     call_insns.push_str(&format!("\tcall {}@PLT\n", f));
-    call_insns.push_str(&format!("\taddq ${}, %rsp\n", 8 * stacked.len()));
+    // if !stacked.is_empty() {
+    //     call_insns.push_str(&format!("\taddq ${}, %rsp\n", 8 * stacked.len() - 8));
+    // }
+    call_insns.push_str(&format!("\tsubq $8, %rsp\n"));
     for arg_pos in stacked.iter().rev() {
         call_insns.push_str(&format!("\tpopq {}\n", arg_pos));
     }
