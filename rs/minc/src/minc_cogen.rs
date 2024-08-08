@@ -1,9 +1,8 @@
-use crate::{cogen_concat_tab, minc_ast};
+use crate::{cogen_concat, cogen_concat_tab, minc_ast};
 mod cogen;
 mod constants;
 mod environment;
 mod location;
-use crate::cogen_concat;
 use constants::*;
 use environment::*;
 use location::*;
