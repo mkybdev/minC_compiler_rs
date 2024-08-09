@@ -17,7 +17,10 @@ minC (subset of C language) Compiler Implementation in Rust
             - Top-level (Global) Variable Declaration Not Supported
     - If
         - If-Else
+        - else if
     - While
+        - Continue
+        - Break
 
 - Expressions
     - Assignment
@@ -34,13 +37,4 @@ minC (subset of C language) Compiler Implementation in Rust
 
 
 # TODOs
-- Statements
-    - Empty
-    - Continue
-    - Break
-
-- Not Tested Features
-    - Parentheses
-    - `~` operator
-    
 - Stack Growth Implementation
