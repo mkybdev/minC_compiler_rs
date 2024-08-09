@@ -8,3 +8,4 @@ rs/minc/**
 !minc_cogen/
 !**/minc_cogen/*
 !minc_cogen.rs
+!Cargo.toml
