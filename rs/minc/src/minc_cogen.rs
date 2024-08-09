@@ -35,12 +35,12 @@ fn trailer() -> String {
 }
 
 /// Formats the machine code in the following ways:
-///     Replaces multiple empty lines with a single empty line.
+///     Removes empty lines.
 /// Returns the formatted machine code.
 fn format_asm(asm: String) -> String {
-    Regex::new(r"\n\s*\n\s*\n")
+    Regex::new(r"\n\n+") // Matches one or more empty lines
         .unwrap()
-        .replace_all(&asm, "\n\n")
+        .replace_all(&asm, "\n") // Replaces with a single empty line
         .to_string()
 }
 
@@ -141,6 +141,7 @@ fn gen_epilogue(def: &minc_ast::Def, num: usize) -> String {
 /// Returns the next label.
 fn next_label(label: &mut String) -> String {
     let next = label.clone();
+    // Label is incremented internally
     *label = format!(
         ".L{:0>2}", // Generates a new label with a two-digit number
         label
@@ -159,8 +160,16 @@ fn next_label(label: &mut String) -> String {
 fn ast_to_asm_stmt(stmt: &minc_ast::Stmt, env: Environment, v: i64, label: &mut String) -> String {
     match stmt {
         minc_ast::Stmt::Empty => format!(""),
-        minc_ast::Stmt::Continue => format!(""),
-        minc_ast::Stmt::Break => format!(""),
+        minc_ast::Stmt::Continue => {
+            // Jumps to condition label
+            // Replaced to condition label afterward
+            cogen_concat_tab!("jmp CONTINUE")
+        }
+        minc_ast::Stmt::Break => {
+            // Jumps to end label
+            // Replaced to end label afterward
+            cogen_concat_tab!("jmp BREAK")
+        }
         minc_ast::Stmt::Return(expr) => {
             let (insns, op) = ast_to_asm_expr(expr, env, v); // Compiles the expression
             cogen_concat!(
@@ -217,20 +226,26 @@ fn ast_to_asm_stmt(stmt: &minc_ast::Stmt, env: Environment, v: i64, label: &mut 
         }
         minc_ast::Stmt::While(cond, body) => {
             let (cond_insns, cond_op) = ast_to_asm_expr(cond, env.clone(), v); // Compiles the condition
-            let label_lc = next_label(label);
-            let label_ls = next_label(label);
+            let label_lc = next_label(label); // Condition label
+            let label_ls = next_label(label); // Body label
+            let label_le = next_label(label); // End label
+            let body_insns =
+                ast_to_asm_stmt(body, env.clone(), v, label) // Compiles the body
+                    .replace("jmp CONTINUE", format!("jmp {}", label_lc).as_str()) // Replaces continue label
+                    .replace("jmp BREAK", format!("jmp {}", label_le).as_str()); // Replaces break label
             cogen_concat!(
                 cogen_concat_tab!(
-                format!("jmp {}", label_lc)        // Jumps to the condition part
+                    format!("jmp {}", label_lc)        // Jumps to the condition part
                 ),
-                format!("{}:", label_ls),             // Body part
-                ast_to_asm_stmt(body, env, v, label), // Compiles the body
-                format!("{}:", label_lc),             // Condition part
-                cond_insns,                           // Compiled condition
+                format!("{}:", label_ls), // Body part
+                body_insns,               // Compiled body
+                format!("{}:", label_lc), // Condition part
+                cond_insns,               // Compiled condition
                 cogen_concat_tab!(
                     format!("cmpq $0, {}", cond_op), // Compares the condition with 0
                     format!("jne {}", label_ls) // Jumps to the body part if the condition is true
-                )
+                ),
+                format!("{}:", label_le) // Jumps to the end
             )
         }
     }
@@ -551,11 +566,17 @@ fn ast_to_asm_expr(expr: &minc_ast::Expr, env: Environment, v: i64) -> (String, 
                         } else {
                             // Compiles the operand
                             let (insns, op) = ast_to_asm_expr(&e[0], env, v);
-                            (
-                                // Bitwise not
-                                cogen_concat!(insns, cogen_concat_tab!(format!("notq {}", op))),
-                                op, // The result is stored in the operand
-                            )
+                            match op {
+                                Location::Immediate(n) => (
+                                    format!(""),             // No instructions
+                                    Location::Immediate(!n), // Bitwise negation
+                                ),
+                                _ => (
+                                    // Bitwise not
+                                    cogen_concat!(insns, cogen_concat_tab!(format!("not {}", op))),
+                                    op, // The result is stored in the operand
+                                ),
+                            }
                         }
                     }
                     _ => panic!("Unknown operator {}", op),
